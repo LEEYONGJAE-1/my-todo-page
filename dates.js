@@ -103,7 +103,7 @@ export function nextWeekday(today, wd) {
   return addDays(today, diff);
 }
 
-/** weekOffset 0=이번 주(월~일), 1=다음 주. wd 0=일요일은 그 주의 마지막 날 */
+/** weekOffset 0=이번 주(월~일), 1=다음 주, 2=다다음 주. wd 0=일요일은 그 주의 마지막 날 */
 export function weekdayInWeek(today, wd, weekOffset = 0) {
   const mon = startOfWeek(today);
   if (!mon) return null;

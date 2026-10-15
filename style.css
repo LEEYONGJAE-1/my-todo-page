@@ -435,10 +435,46 @@ input::placeholder {
 }
 
 /* ── 결과 메시지 ───────────────────────── */
-.message {
+/* 결과 메시지와 🆘 답변 알림을 함께 화면 위에 붙여 둔다.
+   둘을 합친 높이를 화면의 45% 로 제한한다: 메시지는 그대로 두고, 알림이 남은 자리만 쓰며 안에서 스크롤한다
+   (360px 휴대폰에서 메시지 + 알림 여러 개가 목록을 거의 다 가리지 않게). */
+.msg-stack {
   position: sticky;
   top: 0;
   z-index: 20;
+  display: flex;
+  flex-direction: column;
+  max-height: 45vh;
+}
+
+.msg-stack > .message {
+  flex: none;
+}
+
+/* 알림이 여러 개여도 화면 위를 너무 많이 가리지 않게 높이를 제한하고 안에서 스크롤 */
+.notices {
+  flex: 0 1 auto;
+  min-height: 0;
+  max-height: 40vh;
+  overflow-y: auto;
+  overscroll-behavior: contain;
+}
+
+/* 메시지가 길어도 알림 한 줄은 보이게 */
+.notices:not(:empty) {
+  min-height: min(5.5rem, 40vh);
+}
+
+.notices .msg-card {
+  border-left-color: var(--accent);
+}
+
+.notices .msg-card.tone-success {
+  border-left-color: var(--ok);
+}
+
+.notices .msg-card.tone-warn {
+  border-left-color: var(--warn);
 }
 
 .msg-card {
@@ -788,6 +824,12 @@ tr.is-busy {
   color: var(--stuck);
 }
 
+.badge-comments {
+  color: var(--muted);
+  font-weight: 600;
+  font-variant-numeric: tabular-nums;
+}
+
 .actions {
   display: flex;
   flex-wrap: wrap;
@@ -887,6 +929,183 @@ tr.is-busy {
 .sub-list label.is-done span {
   text-decoration: line-through;
   color: var(--muted);
+}
+
+/* 🆘 Claude 답변 패널 (답글은 신뢰할 수 없는 텍스트 — 화면은 textContent 로만 그린다) */
+.reply-panel {
+  margin-top: 8px;
+  padding: 10px 12px;
+  background: var(--surface-2);
+  border: 1px solid var(--border);
+  border-left: 4px solid var(--accent);
+  border-radius: 8px;
+  font-size: 0.92rem;
+  font-weight: 400;
+  max-width: 72ch;
+}
+
+.reply-panel:focus {
+  outline: none;
+}
+
+.reply-panel:focus-visible {
+  outline: 3px solid var(--accent);
+  outline-offset: 2px;
+}
+
+.reply-head {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: baseline;
+  gap: 4px 10px;
+  margin-bottom: 6px;
+}
+
+.reply-title {
+  font-size: 0.95rem;
+}
+
+.reply-state {
+  display: inline-block;
+  padding: 0 8px;
+  border: 1px solid currentColor;
+  border-radius: 999px;
+  font-size: 0.78rem;
+  font-weight: 700;
+  line-height: 1.6;
+  white-space: nowrap;
+}
+
+.reply-state.st-done {
+  color: var(--ok);
+}
+
+.reply-state.st-working {
+  color: var(--warn);
+}
+
+.reply-state.st-error,
+.reply-note.st-error {
+  color: var(--danger);
+}
+
+.reply-time {
+  color: var(--muted);
+  font-size: 0.85rem;
+  font-variant-numeric: tabular-nums;
+}
+
+.reply-gh {
+  font-size: 0.88rem;
+}
+
+.reply-note,
+.reply-empty,
+.reply-ref-head {
+  color: var(--muted);
+  margin: 2px 0 6px;
+}
+
+.reply-empty {
+  font-weight: 600;
+}
+
+.reply-error {
+  color: var(--danger);
+  font-weight: 600;
+  margin: 2px 0 6px;
+}
+
+.reply-ref {
+  border-top: 1px solid var(--border);
+  padding-top: 6px;
+  margin-top: 4px;
+}
+
+.reply-ref-body {
+  white-space: pre-wrap;
+  color: var(--text);
+}
+
+.reply-body {
+  color: var(--text);
+  line-height: 1.55;
+}
+
+.reply-body .r-p {
+  margin: 0 0 4px;
+}
+
+.reply-body .r-h {
+  margin: 10px 0 4px;
+  font-size: 0.98rem;
+  line-height: 1.35;
+}
+
+.reply-body .r-h:first-child {
+  margin-top: 0;
+}
+
+.reply-body .r-hr {
+  border: 0;
+  border-top: 1px solid var(--border);
+  margin: 8px 0;
+}
+
+.reply-body .r-quote {
+  margin: 4px 0;
+  padding-left: 10px;
+  border-left: 3px solid var(--border);
+  color: var(--muted);
+}
+
+.reply-body .r-list {
+  margin: 2px 0 6px;
+  padding-left: 1.3em;
+}
+
+.reply-body .r-list li {
+  margin: 2px 0;
+}
+
+.reply-body .r-check {
+  list-style: none;
+  margin-left: -1.3em;
+  display: flex;
+  gap: 6px;
+  align-items: baseline;
+}
+
+.reply-body .r-box {
+  flex: none;
+  color: var(--accent);
+}
+
+.reply-body .r-check.is-done > span:last-child {
+  text-decoration: line-through;
+  color: var(--muted);
+}
+
+.reply-body code {
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, "D2Coding", monospace;
+  font-size: 0.88em;
+  padding: 0 4px;
+  border-radius: 4px;
+  background: var(--surface);
+  border: 1px solid var(--border);
+  overflow-wrap: anywhere;
+}
+
+.reply-body .r-trunc {
+  color: var(--muted);
+  font-style: italic;
+}
+
+.reply-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  margin-top: 8px;
 }
 
 /* 이번 주 완료 / 반복 목록 */
@@ -1041,6 +1260,15 @@ tr.is-busy {
 
   .msg-actions button.candidate {
     flex-basis: 100%;
+  }
+
+  .reply-panel {
+    padding: 10px;
+    max-width: none;
+  }
+
+  .reply-actions button {
+    flex: 1 1 auto;
   }
 }
 

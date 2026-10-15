@@ -2,13 +2,22 @@
 <html lang="ko">
 <head>
 <meta charset="utf-8">
-<meta http-equiv="Content-Security-Policy" content="default-src 'none'; script-src 'self'; style-src 'self'; connect-src https://api.github.com; img-src 'self' data:; base-uri 'none'; form-action 'none'">
+<meta http-equiv="Content-Security-Policy" content="default-src 'none'; script-src 'self'; style-src 'self'; connect-src https://api.github.com; img-src 'self' data:; manifest-src 'self'; base-uri 'none'; form-action 'none'">
 <meta name="referrer" content="no-referrer">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <meta name="color-scheme" content="light dark">
 <meta name="robots" content="noindex, nofollow">
-<title>할 일</title>
-<link rel="icon" href="data:,">
+<title>What's Next</title>
+<meta name="application-name" content="What's Next">
+<meta name="apple-mobile-web-app-title" content="What's Next">
+<meta name="mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="theme-color" content="#f5f6f8" media="(prefers-color-scheme: light)">
+<meta name="theme-color" content="#0f1216" media="(prefers-color-scheme: dark)">
+<link rel="manifest" href="manifest.webmanifest">
+<link rel="icon" href="icons/icon.svg" type="image/svg+xml">
+<link rel="icon" href="icons/favicon-32.png" sizes="32x32" type="image/png">
+<link rel="apple-touch-icon" href="icons/apple-touch-icon.png">
 <link rel="stylesheet" href="style.css">
 <script type="module" src="app.js"></script>
 </head>
@@ -71,10 +80,14 @@
         <li>대기: 끝을 <strong>대기 · 대기 중 · 기다리는 중</strong>으로 — 예) 고객 회신 대기</li>
         <li>반복: <strong>매일 · 평일마다 · 매주 월요일 · 매월 15일</strong> — 예) 매주 월요일 주간보고 작성하기 (회차는 해당일 아침 07:50 자동 작업이 할 일로 만듭니다)</li>
         <li>추가 정보: 마감(오늘·내일·금요일·10/20), 우선순위(긴급·!! / 언젠가), 제출 대상(○○에게·○○께), 프로젝트([코드]), 예상(2시간), 다음 단계(→ 회신 확인), AI 분해(쪼개서)</li>
+        <li>🆘 막막해요: Claude가 1~3분 뒤 답글로 하위 작업을 제안합니다. 항목의 <strong>[💬 답변 보기]</strong>에서 읽고 <strong>[본문에 반영]</strong>을 누르면 하위 작업이 본문에 추가됩니다.</li>
         <li>금액·계약 조건·개인정보는 적지 말고 자료 위치만 적으세요.</li>
       </ul>
     </details>
-    <div id="message" class="message" role="status" aria-live="polite"></div>
+    <div class="msg-stack">
+      <div id="message" class="message" role="status" aria-live="polite"></div>
+      <div id="notices" class="notices" role="status" aria-live="polite" aria-label="🆘 답변 알림"></div>
+    </div>
     <div id="list-status" class="list-status"></div>
     <div id="groups" class="groups"></div>
     <details id="done-section" class="extra">

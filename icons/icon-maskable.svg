@@ -1,0 +1,24 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512" width="512" height="512">
+<defs><linearGradient id="b" gradientUnits="userSpaceOnUse" x1="0" y1="0" x2="0" y2="512"><stop offset="0" stop-color="#1d4ca3"/><stop offset="1" stop-color="#0c2e72"/></linearGradient><linearGradient id="o" gradientUnits="userSpaceOnUse" x1="0" y1="-53" x2="0" y2="573"><stop offset="0" stop-color="#1d4ca3"/><stop offset="1" stop-color="#0c2e72"/></linearGradient></defs>
+<rect width="512" height="512" fill="url(#b)"/>
+<g transform="translate(256 256) scale(0.8178) translate(-263 -260)">
+<rect x="64" y="140" width="288" height="288" rx="48" fill="#041230" fill-opacity=".32"/>
+<rect x="64" y="128" width="288" height="288" rx="48" fill="#ffffff"/>
+<path d="M64 224V176a48 48 0 0 1 48-48h192a48 48 0 0 1 48 48V224z" fill="#0b62d6"/>
+<path d="M116 248h32a12 12 0 0 1 12 12v16a12 12 0 0 1-12 12h-32a12 12 0 0 1-12-12v-16a12 12 0 0 1 12-12zM192 248h32a12 12 0 0 1 12 12v16a12 12 0 0 1-12 12h-32a12 12 0 0 1-12-12v-16a12 12 0 0 1 12-12zM268 248h32a12 12 0 0 1 12 12v16a12 12 0 0 1-12 12h-32a12 12 0 0 1-12-12v-16a12 12 0 0 1 12-12zM116 304h32a12 12 0 0 1 12 12v16a12 12 0 0 1-12 12h-32a12 12 0 0 1-12-12v-16a12 12 0 0 1 12-12zM192 304h32a12 12 0 0 1 12 12v16a12 12 0 0 1-12 12h-32a12 12 0 0 1-12-12v-16a12 12 0 0 1 12-12zM268 304h32a12 12 0 0 1 12 12v16a12 12 0 0 1-12 12h-32a12 12 0 0 1-12-12v-16a12 12 0 0 1 12-12zM116 360h32a12 12 0 0 1 12 12v16a12 12 0 0 1-12 12h-32a12 12 0 0 1-12-12v-16a12 12 0 0 1 12-12zM192 360h32a12 12 0 0 1 12 12v16a12 12 0 0 1-12 12h-32a12 12 0 0 1-12-12v-16a12 12 0 0 1 12-12zM268 360h32a12 12 0 0 1 12 12v16a12 12 0 0 1-12 12h-32a12 12 0 0 1-12-12v-16a12 12 0 0 1 12-12z" fill="#e4ebf5"/>
+<path d="M128 112a16 16 0 0 1 32 0v48a16 16 0 0 1-32 0zM256 112a16 16 0 0 1 32 0v48a16 16 0 0 1-32 0z" fill="#ffffff"/>
+<path d="M120 318L178 374L274 278" fill="none" stroke="#0b62d6" stroke-width="56" stroke-linecap="round" stroke-linejoin="round"/>
+<path d="M272.7 279.5L286.8 197.4L380.7 85.5A18 18 0 0 1 406 83.3L442.8 114.2A18 18 0 0 1 445 139.5L351.2 251.4z" fill="url(#o)" stroke="url(#o)" stroke-width="18" stroke-linejoin="round"/>
+<g transform="translate(274 278) rotate(-50)">
+<path d="M70 -42H172V42H70z" fill="#ffc93c"/>
+<path d="M70 -42H172V-14H70z" fill="#ffe07a"/>
+<path d="M70 14H172V42H70z" fill="#f29f05"/>
+<path d="M70 -42L4 -3Q0 0 4 3L70 42z" fill="#f6d2a2"/>
+<path d="M70 14L4 3L70 42z" fill="#e3b57a"/>
+<path d="M24 -14.4L4 -3Q0 0 4 3L24 14.4z" fill="#26303f"/>
+<path d="M172 -42h28v84h-28z" fill="#c9d2df"/>
+<path d="M180 -42h6v84h-6zM190 -42h6v84h-6z" fill="#9aa6b8"/>
+<path d="M200 -42H216a18 18 0 0 1 18 18V24a18 18 0 0 1-18 18H200z" fill="#ff8fab"/>
+</g>
+</g>
+</svg>

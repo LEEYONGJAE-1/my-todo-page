@@ -14,8 +14,9 @@ import {
   formatRecurrence,
 } from './dates.js';
 
+// Actions 의 Claude 는 답글만 쓴다. 본문 반영은 홈페이지 [본문에 반영] 버튼이 사용자 토큰으로 한다.
 export const SOS_COMMENT =
-  '@claude 이 할 일을 /todo-stuck 기준으로 진단하고, 하위 작업 3~7개를 본문 체크리스트로 반영하고, 첫 행동을 답글로 알려줘. stuck 라벨이 있으면 제거해줘.';
+  "@claude 이 할 일을 /todo-stuck 기준으로 진단하고, 하위 작업 3~7개를 '- [ ] ' 체크리스트 형식으로 답글에 적고, 첫 행동을 알려줘. 이슈 본문과 라벨은 바꾸지 마(홈페이지에서 반영함).";
 export const COMPLETE_COMMENT = '완료: 홈페이지에서 처리';
 export const DEFAULT_MEMO = '홈페이지에서 등록';
 
@@ -41,8 +42,23 @@ const WAIT_END_RE = /(?:기다리는\s?중|대기\s?중|대기)$/;
 const REGISTER_END_RE = /(?:해야\s?(?:함|해|됨|돼)|할\s?것|하기|필요|예정)$/;
 
 // 반복: 매일 | 평일마다 | 매주 X요일 | 매월 N일 (문장 어디든)
-const RECUR_RE =
-  /(?<![가-힣])(?:(매일)(?:매일)?(?:\s?마다)?|(평일마다)|매주\s*([월화수목금토일])요일(?:마다|까지|에)?|매월\s*(\d{1,2})\s*일(?:마다|까지|에)?)/;
+// - 반복 표현 뒤 조사(에는/엔/은/는/과/와/마다/까지/에)도 함께 지운다. 은·는·과·와는 뒤에 한글이 이어지면(은행·과제) 조사로 보지 않는다.
+// - '매주 월요일과 목요일', '매주 월,수'처럼 요일이 여럿이면 more1/more2 에 나머지 요일이 잡힌다(첫 요일만 규칙으로 쓰고 경고).
+//   목록의 요일은 '요일'이 붙거나 한 글자로 끝나야 한다('매주 월요일과 목표 점검' 의 '목'은 요일 아님).
+// - '매월 1일과 15일', '매월 1일, 15일'처럼 날이 여럿이면 mmore 에 나머지 날이 잡힌다(첫 날만 규칙으로 쓰고 경고).
+//   목록의 날은 뒤에 한글이 없거나 조사만 와야 한다('매월 1일과 2일차 회의'의 '2일차'는 날 아님).
+// - 조사 '엔·은·는·과·와'는 뒤에 한글이 이어지면(엔진·은행·과제) 조사로 보지 않는다.
+//   '에는'은 그런 낱말이 없으므로 붙여 써도 조사로 지운다('월요일에는은행' → '은행').
+const RECUR_DAY = '[월화수목금토일]';
+const RECUR_SEP = '\\s*(?:[,，·/]|과|와|및|하고|이랑|랑)\\s*';
+const RECUR_MORE = `(?:${RECUR_SEP}${RECUR_DAY}(?:요일|(?![가-힣])))`;
+const RECUR_MDAY_MORE = `(?:${RECUR_SEP}\\d{1,2}\\s*일(?:(?![가-힣])|(?=마다|까지|에|엔|은|는|과|와)))`;
+const RECUR_PARTICLE = '(?:마다|까지|에는|(?:엔|은|는|과|와)(?![가-힣])|에)?';
+const RECUR_RE = new RegExp(
+  '(?<![가-힣])(?:(?<daily>매일)(?:매일)?(?:\\s?마다)?|(?<weekdays>평일마다)' +
+    `|매주\\s*(?<wd>${RECUR_DAY})(?:요일(?<more1>${RECUR_MORE}*)|(?<more2>${RECUR_MORE}+))${RECUR_PARTICLE}` +
+    `|매월\\s*(?<md>\\d{1,2})\\s*일(?<mmore>${RECUR_MDAY_MORE}*)${RECUR_PARTICLE})`
+);
 
 // AI 분해 요청
 const DECOMPOSE_RE = /쪼개서|단계별로/;
@@ -55,9 +71,22 @@ const PROJECT_RE_G = /\[\s*([^[\]\s,]{1,40})\s*\]/g;
 // 앞의 '약 '과 뒤의 '정도·쯤·가량'(띄어 써도)은 함께 제거한다.
 const EST_PREFIX = '(?:(?<!\\S)약\\s*)?';
 const EST_SUFFIX = '(?:간|동안|짜리|\\s*(?:정도|쯤|가량))?(?![가-힣])';
-const ESTIMATE_RE = new RegExp(
-  `${EST_PREFIX}(?<![\\d.])(\\d{1,3})\\s*시간(?:\\s*(?:(\\d{1,2})\\s*분|(반)))?${EST_SUFFIX}` +
-    `|${EST_PREFIX}(?<![\\d.])(\\d{1,4})\\s*분${EST_SUFFIX}`
+const EST_HOURS = '(\\d{1,3})\\s*시간(?:\\s*(?:(\\d{1,2})\\s*분|(반)))?';
+const EST_MINUTES = '(\\d{1,4})\\s*분';
+const ESTIMATE_RE_G = new RegExp(
+  `${EST_PREFIX}(?<![\\d.])${EST_HOURS}${EST_SUFFIX}|${EST_PREFIX}(?<![\\d.])${EST_MINUTES}${EST_SUFFIX}`,
+  'g'
+);
+// 예상 소요가 아닌 것(제목에 그대로 둔다):
+// - 시각 'N시 M분'의 분 (앞이 'N시' — 'N시간'은 아님): '10시 30분 병원 예약'
+// - 상대 시간·거리 'N분 전', 'N시간 후·뒤', 'N분 거리', 'N분 만에', 'N분 째' (뒤에 붙는 조사까지 보고 판단: '30분 전에', '전화'는 해당 없음)
+// (둘 다 sticky: lastIndex 위치에서만 검사 — 긴 본문 값에서도 매치마다 전체를 다시 훑지 않는다)
+const EST_CLOCK_BEFORE_RE_Y = /(?<=\d\s*시\s*)/y;
+const EST_RELATIVE_AFTER_RE_Y =
+  /\s*(?:전|후|뒤|거리|만에|째)(?:에는|에도|에서|까지|부터|으로|에|엔|쯤|의|이|가|은|는|도)?(?![가-힣])/y;
+// 다음 단계 괄호 속성 '예상 <값>'의 값 (예상 형식 전체 일치)
+const EST_VALUE_RE = new RegExp(
+  `^(?:약\\s*)?(?:${EST_HOURS}|${EST_MINUTES})(?:간|동안|짜리|\\s*(?:정도|쯤|가량))?$`
 );
 
 // 제출 대상
@@ -66,7 +95,7 @@ const SUBMIT_TO_RE_G = /(?<![^\s(\[{"'“‘,])([^\s(){}[\]"'“”‘’,]+?)(�
 // '께'가 '무렵'의 뜻인 경우(3시께, 월말께, 10일께, 오후께, 다음 주께)는 제출 대상이 아니다
 // ('순'은 초순·중순·하순만 — 김영순께 같은 이름은 제출 대상)
 const KKE_NOT_PERSON_RE =
-  /(?:\d시|말|초|[초중하]순)$|^(?:\d+\s*(?:일|월|주)|오늘|내일|내일모레|모레|오전|오후|아침|점심|저녁|밤|낮|새벽|주|이번주|다음주|담주|금주|차주|[월화수목금토일]요일)$/;
+  /(?:\d시|말|초|[초중하]순)$|^(?:\d+\s*(?:일|월|주)|오늘|내일|내일모레|모레|오전|오후|아침|점심|저녁|밤|낮|새벽|주|이번주|다음주|다다음주|담주|금주|차주|[월화수목금토일]요일)$/;
 
 // 우선순위
 const P1_WORD_RE = /긴급|급함|급하게/;
@@ -228,16 +257,51 @@ function formatEstimate(h, m) {
   return null;
 }
 
+/** ESTIMATE_RE_G / EST_VALUE_RE 매치 → '2시간' | '1시간 30분' | '30분' | null */
+function estimateOf(m) {
+  return m[1] !== undefined ? formatEstimate(m[1], m[3] ? 30 : m[2]) : formatEstimate(0, m[4]);
+}
+
+/** 값 전체가 예상 형식('2시간', '1시간 반', '약 30분')이면 정규화한 값, 아니면 null */
+function estimateValue(v) {
+  const m = EST_VALUE_RE.exec(String(v ?? '').trim());
+  return m ? estimateOf(m) : null;
+}
+
+/** 문장의 첫 예상 소요 {estimate, index, length} — 시각의 분·상대 시간은 건너뛴다 */
+function findEstimate(s) {
+  ESTIMATE_RE_G.lastIndex = 0;
+  for (const m of s.matchAll(ESTIMATE_RE_G)) {
+    if (m[4] !== undefined) {
+      EST_CLOCK_BEFORE_RE_Y.lastIndex = m.index;
+      if (EST_CLOCK_BEFORE_RE_Y.test(s)) continue;
+    }
+    EST_RELATIVE_AFTER_RE_Y.lastIndex = m.index + m[0].length;
+    if (EST_RELATIVE_AFTER_RE_Y.test(s)) continue;
+    const estimate = estimateOf(m);
+    if (estimate) return { estimate, index: m.index, length: m[0].length };
+  }
+  return null;
+}
+
 // ---------------------------------------------------------------------------
 // 마감 날짜 찾기
 
-// 한글 날짜어 뒤 조사: 까지·에·에는·엔(에는의 준말)·께(무렵) 등
+// 날짜 표현 뒤 조사(허용 목록): 까지·까지는·까지만·에·에는·엔(에는의 준말)·중·중에·중으로·은·는·께(무렵).
+// 그 밖의 한글이 바로 붙으면(10월 20일부터·20일자·20일경·3/4분기) 날짜(마감)가 아니다 — 한글 날짜어(오늘·요일)와
+// 숫자 날짜(10/20, 10월 20일, 2026-10-20, 2026년 10월 20일) 모두 같은 규칙.
+// 띄어 쓴 '에·엔·중'은 뒤에 한글이 이어지면(에어컨·엔화·중요) 조사가 아니므로 조사 없이 날짜만 잡는다(끝의 (?![가-힣]) 로 되돌아감).
 const HANGUL_SUFFIX = '(?:\\s*(?:까지는|까지만|까지|에는|엔|에|중으로|중에|중)|은|는|께)?(?![가-힣])';
-// 숫자 날짜 뒤 조사. '에·에는·엔'은 뒤에 한글이 바로 이어지면(에어컨·엔화) 조사로 보지 않는다.
-const NUM_SUFFIX_BODY = '\\s*(?:까지는|까지만|까지)|\\s*(?:에는|엔|에)(?![가-힣])';
-const NUM_SUFFIX = `(?:${NUM_SUFFIX_BODY})?`;
-// 날짜 뒤 요일 괄호: 10/16(금), 10월 16일 (금)
-const DOW_PAREN = '(?:\\s*\\([일월화수목금토]\\))?';
+// 숫자 날짜 뒤 조사: 위와 같되 '까지·까지는·까지만' 뒤에 띄어쓰기 없이 낱말(두 글자 이상)이 이어져도 된다
+// (10/20까지보고서 — 예전 M/D 규칙). 한 글자 조사가 더 붙은 '까지의·까지로·까지요'는 마감 아님(제목 유지 — '의 보고서' 같은 잔재 방지).
+// M/D(10/20)는 '은·는'을 받지 않는다 — 분수('1/2는', '2/3은')가 마감이 되지 않게(예전 규칙 유지).
+const numSuffix = (bare) =>
+  `(?:\\s*(?:까지는|까지만|까지)(?=[^가-힣]|$|[가-힣]{2})|(?:\\s*(?:에는|엔|에|중으로|중에|중)|${bare})(?![가-힣])|(?![가-힣]))`;
+const NUM_SUFFIX = numSuffix('은|는|께');
+const MD_SLASH_SUFFIX = numSuffix('께');
+// 날짜 뒤 요일 괄호: 10/16(금), 10월 16일 (금). 괄호가 뒤에 있으면 반드시 함께 잡는다
+// (괄호를 건너뛰고 날짜만 잡으면 '10/20(화)부터'의 '(화)부터'가 조사 검사를 피해 마감이 된다).
+const DOW_PAREN = '(?:\\s*\\([일월화수목금토]\\)|(?!\\s*\\([일월화수목금토]\\)))';
 
 const DATE_PATTERNS = [
   {
@@ -250,19 +314,26 @@ const DATE_PATTERNS = [
   },
   { kind: 'md', re: new RegExp(`(?<![\\d./-])(\\d{1,2})\\s*월\\s*(\\d{1,2})\\s*일${DOW_PAREN}${NUM_SUFFIX}`, 'g') },
   // M/D: '일'(10/20일)·요일 괄호·조사는 허용. 그 외 한글이 바로 붙으면(3/4분기) 날짜가 아니다.
-  {
-    kind: 'md',
-    re: new RegExp(`(?<![\\d./-])(\\d{1,2})/(\\d{1,2})(?![\\d/])일?${DOW_PAREN}(?:${NUM_SUFFIX_BODY}|(?![가-힣]))`, 'g'),
-  },
+  { kind: 'md', re: new RegExp(`(?<![\\d./-])(\\d{1,2})/(\\d{1,2})(?![\\d/])일?${DOW_PAREN}${MD_SLASH_SUFFIX}`, 'g') },
   { kind: 'rel', re: new RegExp(`(?<![가-힣])(오늘|내일모레|내일|모레)${HANGUL_SUFFIX}`, 'g') },
   {
     kind: 'wd',
-    re: new RegExp(`(?<![가-힣])(?:(이번\\s?주|금주|다음\\s?주|담주|차주)\\s*)?([월화수목금토일])요일${HANGUL_SUFFIX}`, 'g'),
+    re: new RegExp(`(?<![가-힣])(?:(이번\\s?주|금주|다다음\\s?주|다음\\s?주|담주|차주)\\s*)?([월화수목금토일])요일${HANGUL_SUFFIX}`, 'g'),
   },
 ];
 
+/**
+ * 날짜 매치 해석 → {due, warning} 또는 {notDate:true}.
+ * - 월 1~12·일 1~31 밖(15/20 점수, 2026-13-01)은 날짜가 아니다(notDate: 경고 없이 제목에 남긴다).
+ * - 범위 안이지만 실존하지 않는 날짜(2/30)는 due null + 경고(제목에 남긴다).
+ */
 function resolveDateMatch(kind, m, today) {
   const text = m[0].trim();
+  if (kind === 'ymd' || kind === 'md') {
+    const mo = Number(kind === 'ymd' ? m[2] : m[1]);
+    const d = Number(kind === 'ymd' ? m[3] : m[2]);
+    if (!(mo >= 1 && mo <= 12 && d >= 1 && d <= 31)) return { notDate: true, due: null, warning: null };
+  }
   if (kind === 'ymd') {
     const ymd = `${m[1]}-${pad2(m[2])}-${pad2(m[3])}`;
     if (!isValidYMD(ymd)) return { due: null, warning: `존재하지 않는 날짜입니다: ${text}` };
@@ -285,16 +356,22 @@ function resolveDateMatch(kind, m, today) {
     const due = weekdayInWeek(today, wd, 0);
     return { due, warning: due < today ? W_PAST : null };
   }
+  if (prefix === '다다음주') return { due: weekdayInWeek(today, wd, 2), warning: null };
   return { due: weekdayInWeek(today, wd, 1), warning: null };
 }
 
-/** 문장 속 날짜 표현 전부 (위치 순, 겹침 제거) */
+/**
+ * 문장 속 날짜 표현 전부 (위치 순, 겹침 제거). 날짜가 아닌 매치(notDate)는 빼고,
+ * 실존하지 않는 날짜(due null + 경고)는 남긴다(호출부가 경고만 내고 건너뛴다).
+ */
 function findDates(s, today) {
   const found = [];
   for (const { kind, re } of DATE_PATTERNS) {
     re.lastIndex = 0;
     for (const m of s.matchAll(re)) {
-      found.push({ index: m.index, end: m.index + m[0].length, kind, m });
+      const r = resolveDateMatch(kind, m, today);
+      if (r.notDate) continue;
+      found.push({ index: m.index, end: m.index + m[0].length, kind, m, ...r });
     }
   }
   found.sort((a, b) => a.index - b.index || b.end - a.end);
@@ -302,7 +379,7 @@ function findDates(s, today) {
   let lastEnd = -1;
   for (const f of found) {
     if (f.index < lastEnd) continue;
-    out.push({ ...f, ...resolveDateMatch(f.kind, f.m, today) });
+    out.push(f);
     lastEnd = f.end;
   }
   return out;
@@ -345,12 +422,12 @@ function extractCore(text, today, { stripEnd = true, noDue = false } = {}) {
     if (projects.length > 1) warnings.push('프로젝트는 하나만 지정할 수 있어 첫 번째를 사용했습니다');
   }
 
-  // 5) 예상 소요
+  // 5) 예상 소요 (시각의 분·상대 시간은 제외)
   let estimate = null;
-  const em = ESTIMATE_RE.exec(s);
+  const em = findEstimate(s);
   if (em) {
-    estimate = em[1] !== undefined ? formatEstimate(em[1], em[3] ? 30 : em[2]) : formatEstimate(0, em[4]);
-    if (estimate) s = cut(s, em.index, em[0].length);
+    estimate = em.estimate;
+    s = cut(s, em.index, em.length);
   }
 
   // 6) 마감
@@ -360,11 +437,19 @@ function extractCore(text, today, { stripEnd = true, noDue = false } = {}) {
     if (noDue) {
       warnings.push('반복 할 일에는 마감일을 적용하지 않습니다(날짜 표현은 제목에 남겼습니다)');
     } else {
-      const d = dates[0];
-      s = cut(s, d.index, d.end - d.index);
-      due = d.due;
-      if (d.warning) warnings.push(d.warning);
-      if (dates.length > 1) warnings.push('마감 표현이 여러 개라 첫 번째만 사용했습니다');
+      // 실존하지 않는 날짜(2/30)는 경고만 내고 제목에 남긴 채 다음 날짜 표현을 쓴다
+      const valid = [];
+      for (const d of dates) {
+        if (d.due) valid.push(d);
+        else if (d.warning) warnings.push(d.warning);
+      }
+      if (valid.length) {
+        const d = valid[0];
+        s = cut(s, d.index, d.end - d.index);
+        due = d.due;
+        if (d.warning) warnings.push(d.warning);
+        if (valid.length > 1) warnings.push('마감 표현이 여러 개라 첫 번째만 사용했습니다');
+      }
     }
   }
 
@@ -436,18 +521,25 @@ function buildNext(nextText, today) {
     warnings.push('다음 단계 내용이 없습니다');
     return { next: null, warnings };
   }
-  // 저장 형식 그대로 쓴 경우("회신 확인 (Due 2026-10-16, 제출 김과장)"): 괄호 속성을 먼저 해석한다
-  const attrs = parseNextAttrs(collapse(t));
-  const text = attrs ? attrs.title : t;
+  // 저장 형식 그대로 쓴 경우("회신 확인 (Due 2026-10-16, 제출 김과장)"): 괄호 속성을 먼저 해석한다.
+  // 저장 형식이 아닌 괄호('(제출 전 검토)')는 일반 제목 텍스트로 둔다.
+  // 저장 형식으로 보이지만 쓸 수 없는 괄호('(Due 2026-13-40)')는 괄호 밖에서만 추출하고 괄호는 제목에 남긴다.
+  const parsed = parseNextAttrs(collapse(t));
+  const attrs = parsed && !parsed.keep ? parsed : null;
+  const keep = parsed && parsed.keep ? parsed.keep : null;
+  const text = attrs ? attrs.title : keep ? keep.head : t;
   const r = extractCore(text, today, { stripEnd: true });
   for (const w of r.warnings) warnings.push(`다음 단계: ${w}`);
-  if (attrs && attrs.badDue) warnings.push(`다음 단계: 존재하지 않는 날짜입니다: Due ${attrs.badDue}`);
+  // 'Due 2026-13-40'처럼 형식은 맞지만 실존하지 않는 날짜: 괄호는 제목에 남기고 경고(같은 날짜 경고가 이미 있으면 생략)
+  if (parsed && parsed.badDue && !r.warnings.some((w) => w.startsWith('존재하지 않는 날짜'))) {
+    warnings.push(`다음 단계: 존재하지 않는 날짜입니다: Due ${parsed.badDue}`);
+  }
   if (r.decompose) warnings.push('다음 단계의 AI 분해 요청은 무시했습니다');
-  if (!r.task.title) {
+  let next = keep ? { ...r.task, title: titleWithParen(r.task.title, keep.paren) } : r.task;
+  if (!next.title) {
     warnings.push('다음 단계 내용이 없습니다');
     return { next: null, warnings };
   }
-  let next = r.task;
   if (attrs) {
     next = {
       ...next,
@@ -457,6 +549,13 @@ function buildNext(nextText, today) {
       estimate: attrs.estimate ?? next.estimate,
     };
   }
+  // 저장 형식(formatNextValue → parseNextAttrs)으로 다시 읽을 수 없는 제출 대상은 저장하지 않고 알린다
+  // (완료 시 원래 할 일의 제출 대상을 따름). 엄격 형식이 아니어도 확실한 속성(마감·p1·p3·예상)과 함께면 다시 읽힌다.
+  const why = next.submitTo ? nextSubmitProblem(next) : null;
+  if (why) {
+    warnings.push(`다음 단계의 제출 대상 "${next.submitTo}"은(는) 저장되지 않습니다(${why} — 완료 시 원래 할 일의 제출 대상을 따릅니다)`);
+    next = { ...next, submitTo: null };
+  }
   // 저장 형식(formatNextValue)에 자리가 없는 속성은 조용히 사라지지 않도록 알린다
   if (next.project) {
     warnings.push(`다음 단계의 프로젝트 [${next.project}]는 저장되지 않습니다(완료 시 원래 할 일의 프로젝트를 따릅니다)`);
@@ -465,6 +564,18 @@ function buildNext(nextText, today) {
     warnings.push('다음 단계의 대기 표시는 저장되지 않습니다(완료 시 일반 할 일로 등록됩니다)');
   }
   return { next, warnings };
+}
+
+/** 다음 단계 제출 대상을 저장할 수 없는 이유(저장할 수 있으면 null) */
+function nextSubmitProblem(next) {
+  const s = String(next.submitTo ?? '');
+  if (isNextSubmitValue(s)) return null;
+  if (NEXT_SUBMIT_NOT_TARGET_RE.test(s)) return '"전·후·완료·예정·마감·준비·검토·전달" 같은 낱말은 제출 대상으로 저장하지 않습니다';
+  const anchored =
+    Boolean(next.due) || next.priority === 'p1' || next.priority === 'p3' || Boolean(estimateValue(next.estimate));
+  if (anchored && /^[^,()]+$/.test(s)) return null;
+  if (/[\s,()]/.test(s)) return '제출 대상은 한 단어만 저장됩니다';
+  return '한 글자 대상은 마감·우선순위·예상 시간과 함께 적을 때만 저장됩니다';
 }
 
 function unknownResult(original, warnings, task = null) {
@@ -481,20 +592,27 @@ export function parse(text, today) {
 
   // 1) 반복 (문장 어디든)
   const rm = RECUR_RE.exec(main);
+  const rg = rm ? rm.groups : null;
   let recurBlocked = null;
-  if (rm && rm[4] !== undefined) {
-    const n = Number(rm[4]);
+  if (rg && rg.md !== undefined) {
+    const n = Number(rg.md);
     if (n < 1 || n > 31) recurBlocked = '매월 반복은 1~31일만 지정할 수 있습니다';
   }
   if (rm && !recurBlocked) {
     let rule;
-    if (rm[1]) rule = { kind: 'daily' };
-    else if (rm[2]) rule = { kind: 'weekdays' };
-    else if (rm[3]) rule = { kind: 'weekly', weekday: WEEKDAY_KO.indexOf(rm[3]) };
-    else rule = { kind: 'monthly', day: Number(rm[4]) };
+    const ruleWarnings = [];
+    if (rg.daily) rule = { kind: 'daily' };
+    else if (rg.weekdays) rule = { kind: 'weekdays' };
+    else if (rg.wd) {
+      rule = { kind: 'weekly', weekday: WEEKDAY_KO.indexOf(rg.wd) };
+      if (rg.more1 || rg.more2) ruleWarnings.push(`반복은 한 요일만 지원합니다. 첫 요일(${rg.wd})만 등록했습니다`);
+    } else {
+      rule = { kind: 'monthly', day: Number(rg.md) };
+      if (rg.mmore) ruleWarnings.push(`반복은 하루만 지원합니다. 첫 날(${Number(rg.md)}일)만 등록했습니다`);
+    }
     const rest = cut(main, rm.index, rm[0].length);
     const r = extractCore(rest, day, { stripEnd: true, noDue: true });
-    const warnings = [...r.warnings];
+    const warnings = [...ruleWarnings, ...r.warnings];
     if (r.decompose) warnings.push('반복 할 일에는 AI 분해를 적용하지 않습니다');
     if (nextText !== null) warnings.push('반복 문장의 다음 단계는 무시했습니다');
     if (!r.task.title) return unknownResult(original, [...warnings, W_EMPTY]);
@@ -520,9 +638,10 @@ export function parse(text, today) {
     if (nextText !== null) warnings.push(W_COMPLETE_NEXT);
     let kw = s.slice(0, cm.index);
     let number = null;
-    // '#N'은 문장 어디든 번호. '#' 없는 'N번'은 키워드 전체가 그것뿐일 때만 번호('12번 완료').
+    // '#N'은 문장 어디든 번호 — 단 '#' 바로 뒤가 숫자(공백 불가)이고 '#' 앞이 영문자·숫자·'#'이 아닐 때만
+    // ('C# 3장 실습', 'F# 2회차'는 번호 아님). '#' 없는 'N번'은 키워드 전체가 그것뿐일 때만 번호('12번 완료').
     // '1번 과제 제출 완료', '3번 출구 사진 정리 끝'의 N번은 제목 키워드로 남긴다.
-    const hm = /#\s*(\d+)(?:\s*번(?![가-힣\d]))?/.exec(kw) || /^\s*(\d+)\s*번\s*$/.exec(kw);
+    const hm = /(?<![A-Za-z0-9#])#(\d+)(?:\s*번(?![가-힣\d]))?/.exec(kw) || /^\s*(\d+)\s*번\s*$/.exec(kw);
     if (hm) {
       const n = Number(hm[1]);
       if (Number.isSafeInteger(n) && n > 0) number = n;
@@ -574,39 +693,82 @@ export function formatNextValue(task) {
   return attrs.length ? `${title} (${attrs.join(', ')})` : title;
 }
 
+// 괄호 속성 '제출 X'의 X(엄격 형식): 공백 없는 한 단어, 2자 이상, 일반 낱말(전·후·완료·예정·마감·준비·검토·전달
+// — 뒤에 '까지·일·됨' 같은 꼬리가 붙은 형태 포함: '전까지', '마감일', '완료됨')은 제외. '전임·후임·전무님'(사람)은 대상이다.
+const NEXT_SUBMIT_NOT_TARGET_RE =
+  /^(?:전|후|완료|예정|마감|준비|검토|전달)(?:까지|에는|에|엔|일|날|됨|함|중|용|본|분|하기|할|요)?$/;
+function isNextSubmitValue(x) {
+  const v = String(x ?? '');
+  return /^\S+$/.test(v) && charLen(v) >= 2 && !NEXT_SUBMIT_NOT_TARGET_RE.test(v);
+}
+
+const NEXT_DUE_PART_RE = /^due\s*[:：]?\s*(\d{4}-\d{1,2}-\d{1,2})$/i;
+const NEXT_SUBMIT_PART_RE = /^제출\s*[:：]?\s*(.+)$/;
+const NEXT_EST_PART_RE = /^예상\s*[:：]?\s*(.+)$/;
+
 /**
- * 'X (Due YYYY-MM-DD, 제출 Y, p1, 예상 N시간)' 형식의 괄호 속성 해석.
- * 괄호 안 속성을 모두 알아보면 {title, due, submitTo, priority, estimate}, 아니면 null. v 는 collapse 된 문자열.
+ * 'X (Due YYYY-MM-DD, 제출 Y, p1, 예상 N시간)' 형식의 끝 괄호 해석. v 는 collapse 된 문자열. 두 단계로 본다.
+ *  (1) 쉼표로 나눈 모든 부분이 엄격 형식이면 속성:
+ *      'Due YYYY-MM-DD'(실존 날짜) / 'p1' / 'p3' / '예상 <예상 형식 전체>' / '제출 <isNextSubmitValue>'
+ *  (2) 엄격 형식이 아닌 부분이 있어도, 확실한 속성(실존 Due·p1·p3·예상 형식)이 하나라도 있으면 저장 형식으로 보고
+ *      예전에 저장한 값과 같은 너그러운 해석을 한다: '제출 <아무 값>'(제출 팀, 제출 김 과장), 'p2'(무시), '예상 <아무 값>'(예상 반나절).
+ *  그 밖('(제출 전 검토)', '(예상 질문 정리)', '(due diligence)', '(p2)', '(제출 팀)')은 null — 일반 제목 텍스트.
+ * 반환:
+ *  - 속성: {title, due, submitTo, priority, estimate, badDue: null, keep: null}
+ *  - 저장 형식으로 보이지만 속성으로 쓸 수 없음(실존하지 않는 Due, 또는 확실한 속성 옆에 모르는 부분): {badDue, keep: {head, paren}}
+ *    — 호출부는 괄호 밖(head)에서만 추출하고 괄호는 제목에 그대로 둔다('X (Due , …)' 같은 잔재 방지).
  */
 function parseNextAttrs(v) {
   const m = /^(.*\S)\s*\(([^()]*)\)$/.exec(v);
   if (!m) return null;
   const parts = m[2].split(',').map((p) => p.trim()).filter(Boolean);
   if (!parts.length) return null;
-  const t = { due: null, submitTo: null, priority: 'p2', estimate: null, badDue: null };
+  const t = { due: null, submitTo: null, priority: 'p2', estimate: null };
+  let badDue = null;
+  let anchor = false; // 확실한 속성이 있음
+  let loose = false; // 엄격 형식은 아니지만 예전 저장 형식으로는 읽히는 부분이 있음
+  let unknown = false; // 속성으로 읽을 수 없는 부분이 있음
   for (const p of parts) {
     let mm;
-    if ((mm = /^due\s*[:：]?\s*(\S+)$/i.exec(p))) {
-      if (isValidYMD(mm[1])) t.due = mm[1];
-      else t.badDue = mm[1];
-    } else if ((mm = /^제출\s*[:：]?\s*(.+)$/.exec(p))) {
-      t.submitTo = mm[1].trim();
-    } else if (/^p[123]$/i.test(p)) {
+    if ((mm = NEXT_DUE_PART_RE.exec(p))) {
+      if (isValidYMD(mm[1])) {
+        t.due = mm[1];
+        anchor = true;
+      } else badDue = mm[1];
+    } else if (/^p[13]$/i.test(p)) {
       t.priority = p.toLowerCase();
-    } else if ((mm = /^예상\s*[:：]?\s*(.+)$/.exec(p))) {
-      t.estimate = mm[1].trim();
+      anchor = true;
+    } else if (/^p2$/i.test(p)) {
+      loose = true;
+    } else if ((mm = NEXT_EST_PART_RE.exec(p))) {
+      const est = estimateValue(mm[1]);
+      if (est) anchor = true;
+      else loose = true;
+      t.estimate = est || mm[1].trim();
+    } else if ((mm = NEXT_SUBMIT_PART_RE.exec(p))) {
+      t.submitTo = mm[1].trim();
+      if (!isNextSubmitValue(t.submitTo)) loose = true;
     } else {
-      return null;
+      unknown = true;
     }
   }
-  return { title: m[1].trim(), ...t };
+  const keep = { head: m[1].trim(), paren: `(${m[2]})` };
+  if (badDue) return { badDue, keep };
+  if (unknown) return anchor ? { badDue: null, keep } : null;
+  if (loose && !anchor) return null;
+  return { title: m[1].trim(), ...t, badDue: null, keep: null };
+}
+
+/** 괄호를 제목에 그대로 둘 때: 괄호 밖에서 뽑은 제목 + 원래 괄호 */
+function titleWithParen(title, paren) {
+  return collapse(`${title} ${sanitizeText(paren)}`);
 }
 
 export function parseNextValue(value, today) {
   const v = collapse(value ?? '');
   if (!v) return null;
   const a = parseNextAttrs(v);
-  if (a) {
+  if (a && !a.keep) {
     return {
       title: a.title,
       due: a.due,
@@ -617,7 +779,8 @@ export function parseNextValue(value, today) {
       estimate: a.estimate,
     };
   }
-  const r = extractCore(v, normToday(today), { stripEnd: true });
+  const r = extractCore(a ? a.keep.head : v, normToday(today), { stripEnd: true });
+  if (a) return { ...r.task, title: titleWithParen(r.task.title, a.keep.paren) };
   return r.task.title ? r.task : null;
 }
 
@@ -822,7 +985,8 @@ export function matchCandidates(keyword, issues) {
     let score = 0;
     for (const t of tokens) {
       if (title.includes(t)) score += 1;
-      else if (charLen(t) >= 2 && PARTICLES.has(t.slice(-1)) && title.includes(t.slice(0, -1))) score += 1;
+      // 끝 조사 1개 떼기: 뗀 뒤 2자 이상 남는 토큰(3자 이상)만 — '회의'→'회', '문의'→'문' 같은 1자 어간으로는 점수 없음
+      else if (charLen(t) >= 3 && PARTICLES.has(t.slice(-1)) && title.includes(t.slice(0, -1))) score += 1;
     }
     if (score > 0) candidates.push({ issue, score });
   }

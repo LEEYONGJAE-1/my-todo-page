@@ -99,6 +99,8 @@ export const MSG = Object.freeze({
   blockedUrl: '허용되지 않은 주소로의 요청을 막았습니다.',
   tooManyPages: '목록이 너무 많아 모두 불러오지 못했습니다.',
   bodyChanged: '본문이 바뀌었습니다. 새로고침 후 다시 시도하세요',
+  alreadyClosed: '이미 완료된 할 일입니다(다른 곳에서 처리됨). 목록을 새로고침하세요.',
+  applyClosed: '이미 완료된 할 일이라 하위 작업을 반영하지 않았습니다.',
   unexpected: '처리 중 예기치 못한 오류가 발생했습니다. 새로고침 후 다시 시도하세요.',
 });
 
@@ -110,6 +112,8 @@ export class ApiError extends Error {
     this.status = status;
     this.errors = Array.isArray(info.errors) ? info.errors : [];
     this.githubMessage = typeof info.githubMessage === 'string' ? info.githubMessage : '';
+    // 화면이 목록을 정리할 수 있도록 서버의 최신 이슈를 담을 수 있다(예: 이미 닫힌 이슈 409).
+    if (info.issue && typeof info.issue === 'object') this.issue = info.issue;
   }
 }
 
@@ -303,6 +307,10 @@ export function createApi({ token, fetchImpl = globalThis.fetch, base = 'https:/
     async listIssueEvents(n) {
       return paginate(`${issuePath(n)}/events?per_page=100`);
     },
+    // 이슈 댓글 전체(오래된 것부터). 🆘 Claude 답변 확인용.
+    async listComments(n) {
+      return paginate(`${issuePath(n)}/comments?per_page=100`);
+    },
     async getIssue(n) {
       const { data } = await request('GET', issuePath(n), {
         notFound: `#${n} 할 일을 찾을 수 없습니다(없는 번호이거나 접근 권한이 없습니다).`,
@@ -433,7 +441,9 @@ function closeOutcomeUncertain(e) {
 }
 
 /**
- * 완료: 댓글 → close(completed) → `다음:` 있으면 다음 단계 등록(상속) → 회신 확인 제안 여부.
+ * 완료: 최신 상태 확인(GET) → 댓글 → close(completed) → `다음:` 있으면 다음 단계 등록(상속) → 회신 확인 제안 여부.
+ * 화면 목록은 새로고침 전까지(또는 목록 응답 지연으로) 낡을 수 있으므로, 댓글을 달기 전에 단건 조회로 확인한다.
+ * 서버에서 이미 닫혀 있으면 댓글·close·다음 단계 없이 ApiError(409, MSG.alreadyClosed)를 던지고, 오류의 issue 에 최신 이슈를 담는다.
  * close 요청이 실패하면:
  *   - 결과가 불확실한 오류(네트워크·응답 해석 실패·5xx)는 단건 조회로 다시 확인해, 이미 닫혔으면 정상 완료로 계속한다.
  *   - 닫히지 않았음이 확실할 때(4xx 거부, 또는 재조회 결과 open)만 방금 단 완료 댓글을 지우고 오류를 던진다.
@@ -444,6 +454,10 @@ export async function completeIssue(api, issue, today, { labelCache = null } = {
   if (!issue || !Number.isInteger(issue.number)) throw new ApiError('완료할 할 일을 찾을 수 없습니다.', 400);
   if (issue.state === 'closed') throw new ApiError(`#${issue.number}은(는) 이미 완료된 할 일입니다.`, 409);
   const n = issue.number;
+
+  const latest = await api.getIssue(n);
+  if (!latest || typeof latest !== 'object') throw new ApiError(MSG.badResponse, 0);
+  if (latest.state === 'closed') throw new ApiError(MSG.alreadyClosed, 409, { issue: latest });
 
   const comment = await api.addComment(n, COMPLETE_COMMENT);
   let closed;
@@ -472,8 +486,8 @@ export async function completeIssue(api, issue, today, { labelCache = null } = {
     }
   }
 
-  // close 응답이 최신 본문·라벨을 담고 있으므로 그것을 우선한다.
-  const merged = { ...issue, ...(closed && typeof closed === 'object' ? closed : {}), state: 'closed' };
+  // close 응답이 최신 본문·라벨을 담고 있으므로 그것을 우선한다(없으면 방금 조회한 최신 이슈).
+  const merged = { ...issue, ...latest, ...(closed && typeof closed === 'object' ? closed : {}), state: 'closed' };
   if (!merged.closed_at) merged.closed_at = new Date().toISOString();
   if (merged.state_reason == null) merged.state_reason = 'completed';
 
@@ -597,6 +611,407 @@ export async function registerReplyCheck(api, issue, today, opts = {}) {
 /** 🆘 막막해요 / AI 분해 요청: 정해진 @claude 댓글을 단다. */
 export async function requestDecompose(api, number) {
   return api.addComment(number, SOS_COMMENT);
+}
+
+// ─────────────────────────────────────────────────────────────
+// 🆘 Claude 답변(댓글) — 순수 함수 (답글 본문은 신뢰할 수 없는 텍스트로 다룬다)
+// ─────────────────────────────────────────────────────────────
+export const REPLY_POLL_MS = 30 * 1000; // 🆘 후 자동 확인 간격
+export const REPLY_WATCH_MS = 6 * 60 * 1000; // 🆘 후 자동 확인 최대 시간
+export const REPLY_MAX_CHARS = 20000; // 화면에 그리는 답글 최대 길이
+export const REPLY_TRUNCATED_TEXT = '…(GitHub에서 전체 보기)';
+export const SAFE_LINK_PREFIX = 'https://github.com/';
+const REPLY_MAX_ITEMS = 20;
+const REPLY_ITEM_MAX_CHARS = 200;
+const LINE_SPLIT_RE = /\r\n|\n|\r/;
+const FENCE_RE = /^\s{0,3}(`{3,}|~{3,})/;
+const MD_HEADING_RE = /^\s{0,3}(#{1,6})[ \t]+(.*?)(?:[ \t]+#+)?[ \t]*$/;
+const MD_HR_RE = /^\s{0,3}([-*_])[ \t]*(?:\1[ \t]*){2,}$/;
+const MD_QUOTE_RE = /^\s{0,3}(?:>[ \t]?)+(.*)$/;
+const MD_CHECK_RE = /^\s*[-*+][ \t]+\[( |x|X)\](?:[ \t]+(.*))?$/;
+const MD_BULLET_RE = /^\s*[-*+][ \t]+(.*)$/;
+const BOLD_LINE_RE = /^\s*\*\*(.+?)\*\*/; // 굵은 글씨로 시작하는 줄(**3. 하위 작업** 등)
+const BOLD_NUMBER_RE = /^\s*\*\*\s*\d+\s*[.)]/; // 굵은 번호 줄(**4. 첫 행동** 등)
+const BODY_CHECK_RE = /^\s*[-*]\s+\[( |x|X)\]\s+([^\r\n]*)$/; // parser.js 의 본문 체크리스트 형식과 같다
+
+/** 하위 작업 비교용: @claude 치환 → 공백 정규화 → 대소문자 무시 */
+function subtaskKey(s) {
+  return sanitizeText(String(s ?? '')).replace(/\s+/g, ' ').trim().toLowerCase();
+}
+
+function cutChars(s, max) {
+  const cps = Array.from(String(s));
+  return cps.length > max ? cps.slice(0, max).join('') : String(s);
+}
+
+/** 링크 화이트리스트: https://github.com/ 로 시작하고 URL 로 해석했을 때 출처가 github.com 인 것만. 아니면 null. */
+export function safeGithubUrl(href) {
+  const h = typeof href === 'string' ? href : '';
+  if (!h.startsWith(SAFE_LINK_PREFIX)) return null;
+  if (/[\s\u0000-\u001f\u007f<>"'`\\]/.test(h)) return null;
+  try {
+    return new URL(h).origin === 'https://github.com' ? h : null;
+  } catch {
+    return null;
+  }
+}
+
+/** Claude(GitHub 앱 claude[bot]) 댓글인지: user.type 이 Bot 이고 login 이 claude 또는 claude[bot](대소문자 무시). */
+export function isClaudeComment(c) {
+  const u = c && typeof c === 'object' ? c.user : null;
+  if (!u || typeof u !== 'object') return false;
+  return u.type === 'Bot' && typeof u.login === 'string' && /^claude(\[bot\])?$/i.test(u.login);
+}
+
+/**
+ * 답글 상태: 첫 비어있지 않은 줄 기준. 'working' | 'error' | 'done'
+ * claude-code-action 은 실행 중 Claude 가 같은 댓글을 머리줄 없이 통째로 바꿔 쓰고(진행 체크리스트 등),
+ * 실행이 끝날 때만 "**Claude finished …**" / "**Claude encountered an error …**" 머리줄을 붙인다.
+ * 그래서 머리줄이 없는 본문은 아직 작성 중으로 본다(중간 진행 목록을 답으로 알리거나 본문에 반영하지 않게).
+ */
+export function replyState(body) {
+  let first = '';
+  for (const line of String(body ?? '').split(LINE_SPLIT_RE)) {
+    if (line.trim()) {
+      first = line;
+      break;
+    }
+  }
+  // 처음 문구는 "Claude Code is working…" 이므로 ' Code' 도 허용한다.
+  if (/Claude(?: Code)? (?:is )?working|작업 중/i.test(first)) return 'working';
+  if (/encountered an error/i.test(first)) return 'error';
+  if (/Claude finished/i.test(first)) return 'done';
+  return 'working';
+}
+
+/** '작성 중' 답글이 이 시간 넘게 바뀌지 않으면 실행이 끝난 것으로 본다(claude.yml timeout-minutes 15 + 여유). */
+export const STALE_WORKING_MS = 20 * 60 * 1000;
+
+/**
+ * Claude 댓글 중 updated_at 이 가장 늦은 것. since(ISO)가 있으면 created_at 또는 updated_at 이 since 이후(같은 시각 포함)인 것만.
+ * → { id, html_url, body, created_at, updated_at, state, stale } 또는 null
+ * 머리줄이 끝내 붙지 않은 답글(실행이 중간에 끊긴 경우)이 영영 '작성 중'으로 남지 않도록,
+ * updated_at 이 now 기준 STALE_WORKING_MS 보다 오래된 'working' 은 'done' 으로 보고 stale=true 로 표시한다.
+ */
+export function findClaudeReply(comments, { since, now = Date.now() } = {}) {
+  const list = Array.isArray(comments) ? comments : [];
+  const sinceMs = since ? Date.parse(since) : NaN;
+  let best = null;
+  let bestT = -Infinity;
+  for (const c of list) {
+    if (!isClaudeComment(c)) continue;
+    const created = Date.parse(c.created_at);
+    const updated = Date.parse(c.updated_at);
+    if (Number.isFinite(sinceMs)) {
+      const after = (Number.isFinite(created) && created >= sinceMs) || (Number.isFinite(updated) && updated >= sinceMs);
+      if (!after) continue;
+    }
+    const t = Number.isFinite(updated) ? updated : Number.isFinite(created) ? created : 0;
+    if (!best || t >= bestT) {
+      best = c;
+      bestT = t;
+    }
+  }
+  if (!best) return null;
+  const body = typeof best.body === 'string' ? best.body : '';
+  let state = replyState(body);
+  let stale = false;
+  if (state === 'working' && Number.isFinite(bestT) && bestT > 0 && Number(now) - bestT > STALE_WORKING_MS) {
+    state = 'done';
+    stale = true;
+  }
+  return {
+    id: best.id ?? null,
+    html_url: typeof best.html_url === 'string' ? best.html_url : null,
+    body,
+    created_at: best.created_at ?? null,
+    updated_at: best.updated_at ?? best.created_at ?? null,
+    state,
+    stale,
+  };
+}
+
+/**
+ * 답글의 체크리스트 항목 텍스트 배열.
+ * '하위 작업'이 들어간 제목(### …하위 작업…) 또는 굵은 줄(**…하위 작업…**) 다음부터 다음 제목/굵은 번호 줄 전까지의
+ * `- [ ]`·`- [x]`·`* [ ]` 항목을 취하고, 그런 구획(의 항목)이 없으면 답글 전체의 체크리스트 항목을 취한다.
+ * 코드 블록(```) 안은 무시. trim, 빈 것·중복(공백·대소문자 무시) 제거, 각 200자, 최대 20개.
+ */
+export function parseReplyChecklist(body) {
+  const all = [];
+  const section = [];
+  let inSection = false;
+  let fence = null;
+  for (const line of String(body ?? '').split(LINE_SPLIT_RE)) {
+    const f = FENCE_RE.exec(line);
+    if (f) {
+      if (!fence) fence = f[1][0];
+      else if (f[1][0] === fence) fence = null;
+      continue;
+    }
+    if (fence) continue;
+    const h = MD_HEADING_RE.exec(line);
+    const b = h ? null : BOLD_LINE_RE.exec(line);
+    const headText = h ? h[2] : b ? b[1] : null;
+    if (headText != null && headText.includes('하위 작업')) {
+      inSection = true;
+      continue;
+    }
+    if (h || BOLD_NUMBER_RE.test(line)) {
+      inSection = false;
+      continue;
+    }
+    const c = MD_CHECK_RE.exec(line);
+    if (!c) continue;
+    const text = String(c[2] ?? '').trim();
+    if (!text) continue;
+    all.push(text);
+    if (inSection) section.push(text);
+  }
+  const src = section.length ? section : all;
+  const out = [];
+  const seen = new Set();
+  for (const t of src) {
+    const text = cutChars(t, REPLY_ITEM_MAX_CHARS).trim();
+    const key = subtaskKey(text);
+    if (!key || seen.has(key)) continue;
+    seen.add(key);
+    out.push(text);
+    if (out.length >= REPLY_MAX_ITEMS) break;
+  }
+  return out;
+}
+
+/**
+ * 본문의 `## 하위 작업` 구획(줄 시작)에 미체크 항목 `- [ ] text` 를 추가한다. 구획이 없으면 본문 끝에 빈 줄 + `## 하위 작업` 을 만든다.
+ * 본문 어디든 같은 텍스트(공백 정규화·대소문자 무시)의 체크 항목이 이미 있으면 건너뛴다.
+ * 원래 줄바꿈(\r\n/\n) 스타일과 나머지 본문은 그대로 둔다. 추가 텍스트는 sanitizeText(@claude → @ claude).
+ * → { body, added: [...], skipped: [...] }
+ */
+export function mergeSubtasksIntoBody(body, items) {
+  const src = body === null || body === undefined ? '' : String(body);
+  const parts = src.split(/(\r\n|\n|\r)/); // [줄, 구분자, 줄, …, 줄]
+  const eol = src.includes('\r\n') ? '\r\n' : src.includes('\n') ? '\n' : src.includes('\r') ? '\r' : '\n';
+  const have = new Set();
+  for (let i = 0; i < parts.length; i += 2) {
+    const c = BODY_CHECK_RE.exec(parts[i]);
+    if (c) have.add(subtaskKey(c[2]));
+  }
+  const added = [];
+  const skipped = [];
+  for (const it of Array.isArray(items) ? items : []) {
+    const text = sanitizeText(String(it ?? ''))
+      .replace(/[\r\n\u2028\u2029]+/g, ' ')
+      .replace(/\s+/g, ' ')
+      .trim();
+    if (!text) continue;
+    const key = subtaskKey(text);
+    if (have.has(key)) {
+      skipped.push(text);
+      continue;
+    }
+    have.add(key);
+    added.push(text);
+  }
+  if (!added.length) return { body: src, added, skipped };
+  const newLines = added.map((t) => `${eol}- [ ] ${t}`).join('');
+
+  let head = -1;
+  for (let i = 0; i < parts.length; i += 2) {
+    if (parts[i].startsWith('## 하위 작업')) {
+      head = i;
+      break;
+    }
+  }
+  if (head >= 0) {
+    let target = head;
+    for (let i = head + 2; i < parts.length; i += 2) {
+      if (/^#{1,6}\s/.test(parts[i])) break; // 다음 제목에서 구획 끝
+      if (BODY_CHECK_RE.test(parts[i])) target = i;
+    }
+    const out = parts.slice();
+    out[target] += newLines;
+    return { body: out.join(''), added, skipped };
+  }
+  let prefix;
+  if (src === '' || /(?:\r\n|\n|\r)[ \t]*(?:\r\n|\n|\r)[ \t]*$/.test(src)) prefix = '';
+  else if (/(?:\r\n|\n|\r)$/.test(src)) prefix = eol;
+  else prefix = eol + eol;
+  return { body: `${src}${prefix}## 하위 작업${newLines}`, added, skipped };
+}
+
+const INLINE_ESCAPABLE = new Set([...'\\`*_[]()#+-.!>~|{}']);
+const LINK_RE = /\[([^\]\r\n]{0,500})\]\([ \t]*([^()\s]{0,2000})(?:[ \t]+"[^"\r\n]{0,200}")?[ \t]*\)/y;
+
+/** 한 줄 → 인라인 세그먼트 [{t:'text'|'bold'|'code'|'link', v, href?}]. link 는 safeGithubUrl 을 통과할 때만. */
+export function inlineSegments(text) {
+  const s = String(text ?? '');
+  const out = [];
+  let buf = '';
+  const flush = () => {
+    if (!buf) return;
+    const last = out[out.length - 1];
+    if (last && last.t === 'text') last.v += buf;
+    else out.push({ t: 'text', v: buf });
+    buf = '';
+  };
+  let i = 0;
+  while (i < s.length) {
+    const ch = s[i];
+    if (ch === '\\' && i + 1 < s.length && INLINE_ESCAPABLE.has(s[i + 1])) {
+      buf += s[i + 1];
+      i += 2;
+      continue;
+    }
+    if (ch === '`') {
+      let n = 1;
+      while (s[i + n] === '`') n += 1;
+      const mark = '`'.repeat(n);
+      const end = s.indexOf(mark, i + n);
+      if (end > i + n) {
+        flush();
+        out.push({ t: 'code', v: s.slice(i + n, end) });
+        i = end + n;
+        continue;
+      }
+      buf += mark;
+      i += n;
+      continue;
+    }
+    if (ch === '*' && s[i + 1] === '*') {
+      const end = s.indexOf('**', i + 2);
+      if (end > i + 2 && s.slice(i + 2, end).trim()) {
+        flush();
+        out.push({ t: 'bold', v: s.slice(i + 2, end) });
+        i = end + 2;
+        continue;
+      }
+      buf += '**';
+      i += 2;
+      continue;
+    }
+    if (ch === '[' && s[i - 1] !== '!') {
+      LINK_RE.lastIndex = i;
+      const m = LINK_RE.exec(s);
+      if (m) {
+        const label = m[1].trim() || m[2];
+        const href = safeGithubUrl(m[2]);
+        if (href) {
+          flush();
+          out.push({ t: 'link', v: label, href });
+        } else {
+          buf += label; // 허용하지 않은 링크는 글자만 남긴다
+        }
+        i += m[0].length;
+        continue;
+      }
+    }
+    buf += ch;
+    i += 1;
+  }
+  flush();
+  return out;
+}
+
+/**
+ * 답글 마크다운 → 안전 렌더링용 블록 배열(일부 문법만):
+ * {type:'heading', level:1~3, inline} · {type:'paragraph', inline} · {type:'bullet', inline} · {type:'check', checked, inline}
+ * · {type:'hr'} · {type:'blockquote', inline}. 코드 블록 줄은 code 세그먼트 문단, HTML 태그·이미지·표는 글자 그대로.
+ * 입력이 REPLY_MAX_CHARS 를 넘으면 잘라 내고 마지막에 '…(GitHub에서 전체 보기)' 문단(truncated:true)을 붙인다.
+ */
+export function replyBlocks(markdown) {
+  let src = String(markdown ?? '');
+  let truncated = false;
+  if (src.length > REPLY_MAX_CHARS) {
+    let cut = REPLY_MAX_CHARS;
+    const code = src.charCodeAt(cut - 1);
+    if (code >= 0xd800 && code <= 0xdbff) cut -= 1; // 서로게이트 쌍을 가르지 않는다
+    src = src.slice(0, cut);
+    truncated = true;
+  }
+  const blocks = [];
+  let fence = null;
+  for (const line of src.split(LINE_SPLIT_RE)) {
+    const f = FENCE_RE.exec(line);
+    if (f && (!fence || f[1][0] === fence)) {
+      fence = fence ? null : f[1][0];
+      continue;
+    }
+    if (fence) {
+      if (line.trim()) blocks.push({ type: 'paragraph', inline: [{ t: 'code', v: line }] });
+      continue;
+    }
+    if (!line.trim()) continue;
+    if (MD_HR_RE.test(line)) {
+      blocks.push({ type: 'hr' });
+      continue;
+    }
+    let m = MD_HEADING_RE.exec(line);
+    if (m) {
+      if (m[2].trim()) blocks.push({ type: 'heading', level: Math.min(3, m[1].length), inline: inlineSegments(m[2].trim()) });
+      continue;
+    }
+    m = MD_QUOTE_RE.exec(line);
+    if (m) {
+      if (m[1].trim()) blocks.push({ type: 'blockquote', inline: inlineSegments(m[1].trim()) });
+      continue;
+    }
+    m = MD_CHECK_RE.exec(line);
+    if (m) {
+      blocks.push({ type: 'check', checked: m[1] !== ' ', inline: inlineSegments(String(m[2] ?? '').trim()) });
+      continue;
+    }
+    m = MD_BULLET_RE.exec(line);
+    if (m) {
+      blocks.push({ type: 'bullet', inline: inlineSegments(m[1].trim()) });
+      continue;
+    }
+    blocks.push({ type: 'paragraph', inline: inlineSegments(line.trim()) });
+  }
+  if (truncated) blocks.push({ type: 'paragraph', truncated: true, inline: [{ t: 'text', v: REPLY_TRUNCATED_TEXT }] });
+  return blocks;
+}
+
+/**
+ * [본문에 반영]: 최신 이슈 GET → mergeSubtasksIntoBody → 추가할 항목이 있을 때만 PATCH body
+ * → (최신 라벨에) stuck 이 있으면 제거(404 무시).
+ * → { issue: PATCH 응답 또는 최신 이슈(라벨 반영), added, skipped, stuckRemoved, stuckError }
+ * - 최신 이슈가 이미 닫혀 있으면(다른 곳에서 완료) 쓰지 않고 ApiError(409) — 오류의 issue 에 최신 이슈.
+ * - 본문을 이미 고친 뒤 stuck 제거만 실패하면 던지지 않고 stuckError 에 담아 돌려준다(본문 반영은 성공이므로 화면을 갱신해야 함).
+ *   본문을 고치지 않았으면(추가할 항목 없음) 그대로 던진다.
+ */
+export async function applyReplySubtasks(api, number, items) {
+  const n = positiveInt(number);
+  const fresh = await api.getIssue(n);
+  if (!fresh || typeof fresh !== 'object') throw new ApiError(MSG.badResponse, 0);
+  if (fresh.state === 'closed') throw new ApiError(MSG.applyClosed, 409, { issue: fresh });
+  const merged = mergeSubtasksIntoBody(typeof fresh.body === 'string' ? fresh.body : '', items);
+  let issue = fresh;
+  let patchedBody = false;
+  if (merged.added.length > 0) {
+    const patched = await api.updateIssue(n, { body: merged.body });
+    issue = patched && typeof patched === 'object' ? patched : { ...fresh, body: merged.body };
+    patchedBody = true;
+  }
+  let stuckRemoved = false;
+  let stuckError = null;
+  if (labelNames(issue).includes('stuck')) {
+    let labels;
+    try {
+      labels = await api.removeLabel(n, 'stuck');
+    } catch (e) {
+      if (!patchedBody) throw e;
+      stuckError = e;
+    }
+    if (!stuckError) {
+      stuckRemoved = Array.isArray(labels);
+      const rest = Array.isArray(labels)
+        ? labels
+        : (Array.isArray(issue.labels) ? issue.labels : []).filter((l) => (typeof l === 'string' ? l : l && l.name) !== 'stuck');
+      issue = { ...issue, labels: rest };
+    }
+  }
+  return { issue, added: merged.added, skipped: merged.skipped, stuckRemoved, stuckError };
 }
 
 /** waiting 라벨 추가/제거. opts.waiting(boolean)으로 원하는 상태를 지정할 수 있다. 라벨이 반영된 issue 반환. */
@@ -745,6 +1160,16 @@ function clockText(ms) {
   }
 }
 
+/** ISO 시각 → 한국 시간 '10/15(목) 09:34'. 해석 불가면 ''. */
+function dateTimeText(iso) {
+  const t = Date.parse(iso);
+  if (!Number.isFinite(t)) return '';
+  const d = shortDate(toKSTDate(iso));
+  return d ? `${d} ${clockText(t)}` : clockText(t);
+}
+
+const REPLY_STATE_TEXT = Object.freeze({ working: '작성 중', done: '완료', error: '오류' });
+
 function describeTask(task, today, { waiting = false } = {}) {
   if (!task) return '';
   const parts = [];
@@ -832,6 +1257,7 @@ function boot() {
     doneList: byId('done-list'),
     recurringCount: byId('recurring-count'),
     recurringList: byId('recurring-list'),
+    notices: byId('notices'),
   };
   if (Object.values(els).some((v) => !v)) {
     els.app.replaceChildren(el('p', { class: 'fatal' }, '페이지 구성 요소를 찾지 못했습니다. 새로고침해 주세요.'));
@@ -857,9 +1283,15 @@ function boot() {
     groupOpen: new Map(),
     confirmDelete: null,
     today: todayKST(),
+    replies: new Map(), // number → {loading, error, reply, latest, count, at, seq}: 댓글(Claude 답변) 조회 결과
+    replyOpen: new Set(), // 답변 패널을 펼친 이슈 번호
+    replySeq: 0,
+    watch: new Map(), // number → 🆘 후 자동 확인 상태(이슈당 타이머 1개)
+    notices: new Map(), // number → 🆘 답변 도착/시간 초과 알림
   };
   let msgState = null;
   let undoTimer = null;
+  let noticeSig = '';
 
   // ── 상태 헬퍼 ─────────────────────────────────────────
   const issueKey = (n) => `issue:${n}`;
@@ -915,6 +1347,7 @@ function boot() {
     renderGroups(today);
     renderDone(today);
     renderRecurring();
+    renderNotices();
     els.inputBtn.disabled = S.busy.has('input');
     if (focus && document.activeElement !== byId(focus.id)) restoreFocus(focus);
   }
@@ -1083,6 +1516,7 @@ function boot() {
     const area = labels.includes('area:personal') ? '개인' : labels.includes('area:work') ? '업무' : '';
     const title = issue.title || '(제목 없음)';
     const projects = projectsOf(labels);
+    const comments = Number.isSafeInteger(issue.comments) && issue.comments > 0 ? issue.comments : 0;
     // 중간 폭(641~999px)에서는 우선순위·영역·프로젝트·예상 열을 숨기고 제목 아래 한 줄로 보여 준다(CSS로 전환)
     const metaInline = el(
       'p',
@@ -1103,10 +1537,12 @@ function boot() {
         el('span', { class: 'title-text' }, title),
         groupKey === 'overdue' && isWaiting ? el('span', { class: 'badge badge-waiting' }, '대기') : null,
         labels.includes('stuck') ? el('span', { class: 'badge badge-stuck' }, '막힘') : null,
+        comments ? el('span', { class: 'badge badge-comments', title: `댓글 ${comments}개` }, `💬 ${comments}`) : null,
       ),
       metaInline,
       f.next ? el('p', { class: 'next-step' }, el('span', { class: 'next-key' }, '다음:'), ' ', f.next) : null,
       renderSubtasks(issue, f.subtasks, busy, groupKey),
+      renderReplyPanel(issue, groupKey, busy),
     );
 
     const due = f.due;
@@ -1115,6 +1551,9 @@ function boot() {
     else if (due && due <= addDays(today, 1)) dueCls += ' due-soon';
 
     const sosSent = !canRequestSos(storage, n, Date.now());
+    const replyOpen = S.replyOpen.has(n);
+    const showReply = comments > 0 || sosSent || replyOpen || S.watch.has(n) || S.replies.has(n);
+    const replyLabel = replyOpen ? '💬 답변 닫기' : '💬 답변 보기';
     const actions = el(
       'td',
       { class: 'c-actions', 'data-label': '작업' },
@@ -1159,6 +1598,22 @@ function boot() {
           },
           sosSent ? '🆘 요청됨' : '🆘 막막해요',
         ),
+        showReply
+          ? el(
+              'button',
+              {
+                type: 'button',
+                class: 'reply-btn',
+                id: `btn-reply-${groupKey}-${n}`,
+                dataset: { fkey: `btn-reply-${n}` },
+                'aria-expanded': String(replyOpen),
+                'aria-controls': replyOpen ? `reply-${groupKey}-${n}` : null,
+                'aria-label': `${replyLabel}: #${n} ${title}`,
+                onclick: () => onReplyToggle(n),
+              },
+              replyLabel,
+            )
+          : null,
       ),
     );
 
@@ -1242,6 +1697,213 @@ function boot() {
       wrap.append(ul);
     }
     return wrap;
+  }
+
+  // ── 🆘 Claude 답변 패널 ───────────────────────────────
+  function renderInline(segs) {
+    return (segs || []).map((sg) => {
+      if (sg.t === 'bold') return el('strong', null, sg.v);
+      if (sg.t === 'code') return el('code', null, sg.v);
+      const href = sg.t === 'link' ? safeGithubUrl(sg.href) : null;
+      if (href) return el('a', { href, target: '_blank', rel: 'noopener noreferrer' }, sg.v);
+      return String(sg.v ?? '');
+    });
+  }
+
+  /** replyBlocks 결과 → DOM(createElement/textContent만). 연속된 bullet/check 는 한 목록으로 묶는다. */
+  function renderReplyBlocks(blocks) {
+    const out = [];
+    let list = null;
+    for (const b of blocks) {
+      if (b.type === 'bullet' || b.type === 'check') {
+        if (!list) {
+          list = el('ul', { class: 'r-list' });
+          out.push(list);
+        }
+        if (b.type === 'check') {
+          list.append(
+            el(
+              'li',
+              { class: `r-check${b.checked ? ' is-done' : ''}` },
+              el('span', { class: 'r-box', 'aria-hidden': 'true' }, b.checked ? '☑' : '☐'),
+              b.checked ? el('span', { class: 'visually-hidden' }, '(완료) ') : null,
+              el('span', null, renderInline(b.inline)),
+            ),
+          );
+        } else {
+          list.append(el('li', null, renderInline(b.inline)));
+        }
+        continue;
+      }
+      list = null;
+      if (b.type === 'heading') out.push(el(`h${Math.min(3, Math.max(1, b.level || 1)) + 3}`, { class: 'r-h' }, renderInline(b.inline)));
+      else if (b.type === 'hr') out.push(el('hr', { class: 'r-hr' }));
+      else if (b.type === 'blockquote') out.push(el('blockquote', { class: 'r-quote' }, renderInline(b.inline)));
+      else out.push(el('p', { class: b.truncated ? 'r-p r-trunc' : 'r-p' }, renderInline(b.inline)));
+    }
+    return out;
+  }
+
+  /** [본문에 반영] 버튼 상태: 항목·아직 본문에 없는 개수·문구 */
+  function applyInfo(issue, reply) {
+    if (!reply) return { items: [], pending: 0, label: '반영할 하위 작업 없음', enabled: false };
+    const items = parseReplyChecklist(reply.body);
+    if (!items.length) return { items, pending: 0, label: '반영할 하위 작업 없음', enabled: false };
+    if (reply.state === 'working') return { items, pending: 0, label: '작성 중 — 완료 후 반영', enabled: false };
+    if (issue && issue.state === 'closed') return { items, pending: 0, label: '완료된 할 일 — 반영 안 함', enabled: false };
+    const pending = mergeSubtasksIntoBody(issue && issue.body, items).added.length;
+    if (!pending) return { items, pending, label: '이미 반영됨', enabled: false };
+    return { items, pending, label: `본문에 반영 (${pending}개)`, enabled: true };
+  }
+
+  function renderReplyPanel(issue, groupKey, busy) {
+    const n = issue.number;
+    if (!S.replyOpen.has(n)) return null;
+    const entry = S.replies.get(n) || { loading: true, error: null, reply: null, latest: null };
+    const reply = entry.reply;
+    const head = el('div', { class: 'reply-head' }, el('strong', { class: 'reply-title' }, 'Claude 답변'));
+    if (reply) {
+      head.append(el('span', { class: `reply-state st-${reply.state}` }, REPLY_STATE_TEXT[reply.state] || '완료'));
+      const when = dateTimeText(reply.updated_at || reply.created_at);
+      if (when) head.append(el('span', { class: 'reply-time' }, when));
+      const href = safeGithubUrl(reply.html_url);
+      if (href) head.append(el('a', { class: 'reply-gh', href, target: '_blank', rel: 'noopener noreferrer' }, 'GitHub에서 보기'));
+    }
+    const kids = [head];
+    if (entry.loading) kids.push(el('p', { class: 'reply-note' }, reply ? '최신 답변을 확인하는 중…' : '답변을 불러오는 중…'));
+    if (entry.error) kids.push(el('p', { class: 'reply-error' }, `답변을 불러오지 못했습니다: ${errorText(entry.error)}`));
+    if (S.watch.has(n)) kids.push(el('p', { class: 'reply-note' }, '🆘 답변을 자동으로 확인하는 중입니다(30초 간격, 최대 6분).'));
+    const reload = el(
+      'button',
+      {
+        type: 'button',
+        id: `btn-rreload-${groupKey}-${n}`,
+        dataset: { fkey: `btn-rreload-${n}` },
+        disabled: Boolean(entry.loading),
+        onclick: () => loadReply(n),
+      },
+      '다시 불러오기',
+    );
+    if (reply) {
+      if (reply.state === 'working') kids.push(el('p', { class: 'reply-note' }, 'Claude가 답변을 작성하고 있습니다. 잠시 뒤 [다시 불러오기]를 누르세요.'));
+      if (reply.state === 'error') kids.push(el('p', { class: 'reply-note st-error' }, 'Claude 실행이 오류로 끝났습니다. 아래 내용이 완전하지 않을 수 있습니다.'));
+      if (reply.stale) kids.push(el('p', { class: 'reply-note' }, '이 답변은 20분 넘게 바뀌지 않아 실행이 끝난 것으로 봅니다. 내용이 완전하지 않을 수 있습니다.'));
+      kids.push(el('div', { class: 'reply-body' }, renderReplyBlocks(replyBlocks(reply.body))));
+      const info = applyInfo(issue, reply);
+      kids.push(
+        el(
+          'div',
+          { class: 'reply-actions' },
+          el(
+            'button',
+            {
+              type: 'button',
+              class: info.enabled ? 'primary' : null,
+              id: `btn-apply-${groupKey}-${n}`,
+              dataset: { fkey: `btn-apply-${n}` },
+              disabled: busy || !info.enabled,
+              'aria-label': `${info.label}: #${n}`,
+              onclick: () => onApplyReply(n),
+            },
+            info.label,
+          ),
+          reload,
+        ),
+      );
+    } else if (!entry.loading) {
+      if (!entry.error) kids.push(el('p', { class: 'reply-empty' }, '아직 Claude 답변이 없습니다'));
+      const c = entry.latest;
+      if (!entry.error && c && typeof c === 'object') {
+        const who = c.user && typeof c.user.login === 'string' && c.user.login ? c.user.login : '알 수 없음';
+        const raw = typeof c.body === 'string' ? c.body.trim() : '';
+        const text = Array.from(raw).length > 300 ? `${cutChars(raw, 300)}…` : raw;
+        const when = dateTimeText(c.created_at);
+        kids.push(
+          el(
+            'div',
+            { class: 'reply-ref' },
+            el('p', { class: 'reply-ref-head' }, `최근 댓글(참고): ${who}${when ? ` · ${when}` : ''}`),
+            text ? el('p', { class: 'reply-ref-body' }, text) : null,
+          ),
+        );
+      }
+      kids.push(el('div', { class: 'reply-actions' }, reload));
+    }
+    return el(
+      'section',
+      { class: 'reply-panel', id: `reply-${groupKey}-${n}`, dataset: { replyFor: n }, tabindex: '-1', 'aria-label': `#${n} Claude 답변` },
+      kids,
+    );
+  }
+
+  /**
+   * 🆘 알림 영역. render() 마다 불리지만, 내용(알림·버튼 상태)이 같으면 DOM 을 바꾸지 않는다
+   * (aria-live 영역을 매번 갈아 끼우면 화면 읽기 프로그램이 같은 알림을 되풀이해 읽는다).
+   */
+  function renderNotices() {
+    const sig = JSON.stringify(
+      [...S.notices.values()].map((nt) => {
+        const entry = S.replies.get(nt.n);
+        const info = nt.kind === 'arrived' ? applyInfo(S.issues.get(nt.n) || { number: nt.n, body: '' }, entry && entry.reply) : null;
+        return [nt.n, nt.kind, nt.state || '', nt.message || '', info && info.label, info && info.enabled, S.busy.has(issueKey(nt.n))];
+      }),
+    );
+    if (sig === noticeSig && els.notices.childNodes.length === S.notices.size) return;
+    noticeSig = sig;
+    const cards = [];
+    for (const nt of S.notices.values()) {
+      const n = nt.n;
+      const lines = [];
+      const actions = [];
+      let tone = 'info';
+      if (nt.kind === 'arrived') {
+        tone = 'success';
+        lines.push(['🆘 ', issueLink(n), ' 에 Claude 답변이 도착했습니다']);
+        if (nt.state === 'error') lines.push('Claude 실행은 오류로 끝났지만 답변 내용은 볼 수 있습니다.');
+        const entry = S.replies.get(n);
+        const info = applyInfo(S.issues.get(n) || { number: n, body: '' }, entry && entry.reply);
+        actions.push(
+          el('button', { type: 'button', id: `btn-nview-${n}`, onclick: () => onNoticeView(n) }, '답변 보기'),
+          el(
+            'button',
+            {
+              type: 'button',
+              class: info.enabled ? 'primary' : null,
+              id: `btn-napply-${n}`,
+              disabled: S.busy.has(issueKey(n)) || !info.enabled,
+              onclick: () => onApplyReply(n),
+            },
+            info.label,
+          ),
+        );
+      } else if (nt.kind === 'timeout') {
+        lines.push(['🆘 ', issueLink(n), ' 아직 답변이 없습니다. 잠시 뒤 항목의 [💬 답변 보기]로 확인하세요.']);
+      } else {
+        tone = 'warn';
+        lines.push(['🆘 ', issueLink(n), ` 답변 자동 확인을 멈췄습니다: ${nt.message || MSG.unexpected}`]);
+      }
+      const card = el(
+        'div',
+        { class: `msg-card notice tone-${tone}`, dataset: { noticeFor: n } },
+        el('div', { class: 'msg-text' }, lines.map((ln) => el('p', null, ln))),
+        actions.length ? el('div', { class: 'msg-actions' }, actions) : null,
+        el(
+          'button',
+          {
+            type: 'button',
+            class: 'msg-close',
+            'aria-label': `#${n} 알림 닫기`,
+            onclick: () => {
+              S.notices.delete(n);
+              render();
+            },
+          },
+          '×',
+        ),
+      );
+      cards.push(card);
+    }
+    els.notices.replaceChildren(...cards);
   }
 
   function renderDone(today) {
@@ -1556,9 +2218,11 @@ function boot() {
     let tone = 'success';
     if (decompose) {
       try {
-        await requestDecompose(S.api, issue.number);
+        const sosComment = await requestDecompose(S.api, issue.number);
         markSos(storage, issue.number, Date.now());
+        afterSosRequested(issue.number, sosComment);
         lines.push('AI 분해(🆘)를 요청했습니다. 1~3분 후 GitHub에 답글이 달립니다.');
+        lines.push('이 페이지를 열어 두면 30초마다(최대 6분) 확인해 답변이 오면 알려 드립니다.');
       } catch (e) {
         tone = 'warn';
         lines.push(`AI 분해 요청은 실패했습니다: ${errorText(e)} 목록의 🆘 막막해요 버튼으로 다시 요청할 수 있습니다.`);
@@ -1697,7 +2361,19 @@ function boot() {
     return runIssueAction(n, async () => {
       const issue = S.issues.get(n);
       if (!issue) throw new ApiError('할 일을 찾을 수 없습니다. 새로고침 후 다시 시도하세요.', 404);
-      const res = await completeIssue(S.api, issue, todayKST(), { labelCache: S.labelCache });
+      let res;
+      try {
+        res = await completeIssue(S.api, issue, todayKST(), { labelCache: S.labelCache });
+      } catch (e) {
+        // 다른 곳에서 이미 완료됨(409): 서버의 최신 이슈로 목록을 정리한 뒤 안내한다(🆘 자동 확인도 멈춤).
+        if (e instanceof ApiError && e.status === 409 && e.issue && Number.isInteger(e.issue.number)) {
+          upsert(e.issue);
+          stopReplyWatch(n);
+        }
+        throw e;
+      }
+      // 완료한 할 일의 🆘 자동 확인은 멈춘다(닫힌 이슈에 "답변 도착 · 본문에 반영"을 띄우지 않게)
+      stopReplyWatch(n);
       upsert(res.issue);
       if (res.nextIssue) upsert(res.nextIssue);
       clearInputIf(sourceText);
@@ -1788,17 +2464,22 @@ function boot() {
         tone: 'info',
         lines: [
           [issueLink(n), ` 🆘 요청은 이미 보냈습니다. ${mins}분 후에 다시 요청할 수 있습니다.`],
-          '1~3분 후 GitHub에 답글이 달립니다.',
+          '1~3분 후 GitHub에 답글이 달립니다. 답변은 항목의 [💬 답변 보기]에서 볼 수 있습니다.',
         ],
       });
       return;
     }
     return runIssueAction(n, async () => {
-      await requestDecompose(S.api, n);
+      const sosComment = await requestDecompose(S.api, n);
       markSos(storage, n, Date.now());
+      afterSosRequested(n, sosComment);
       showMessage({
         tone: 'success',
-        lines: [[issueLink(n), ' 🆘 막막해요 요청을 보냈습니다.'], '1~3분 후 GitHub에 답글이 달립니다.'],
+        lines: [
+          [issueLink(n), ' 🆘 막막해요 요청을 보냈습니다.'],
+          '1~3분 후 GitHub에 답글이 달립니다.',
+          '이 페이지를 열어 두면 30초마다(최대 6분) 확인해 답변이 오면 알려 드립니다. 답변은 항목의 [💬 답변 보기]에서도 볼 수 있습니다.',
+        ],
       });
     });
   }
@@ -1812,6 +2493,211 @@ function boot() {
       const updated = await toggleSubtask(S.api, n, item, checked);
       upsert(updated);
     });
+  }
+
+  // ── 🆘 Claude 답변: 불러오기 / 반영 / 자동 확인 ─────────
+  function replyEntry(comments, seq) {
+    const list = (Array.isArray(comments) ? comments : []).filter((c) => c && typeof c === 'object');
+    let latest = null;
+    for (const c of list) if (!latest || timeOf(c.created_at) >= timeOf(latest.created_at)) latest = c;
+    return { loading: false, error: null, reply: findClaudeReply(list), latest, count: list.length, at: Date.now(), seq };
+  }
+
+  /** 댓글 수를 화면 상태에 반영(재조회 없음). 바뀌었으면 true. */
+  function setCommentCount(n, count) {
+    const i = S.issues.get(n);
+    if (!i || !Number.isSafeInteger(count) || count < 0 || i.comments === count) return false;
+    S.issues.set(n, { ...i, comments: count });
+    const r = S.recent.get(n);
+    if (r) S.recent.set(n, { issue: { ...r.issue, comments: count }, at: r.at });
+    return true;
+  }
+
+  async function loadReply(n) {
+    if (!S.api) return;
+    const api = S.api;
+    const seq = ++S.replySeq;
+    const prev = S.replies.get(n);
+    S.replies.set(n, { reply: null, latest: null, count: 0, at: 0, ...(prev || {}), loading: true, error: null, seq });
+    render();
+    try {
+      const comments = await api.listComments(n);
+      const cur = S.replies.get(n);
+      if (api !== S.api || !cur || cur.seq !== seq) return;
+      S.replies.set(n, replyEntry(comments, seq));
+      setCommentCount(n, comments.length);
+    } catch (e) {
+      const cur = S.replies.get(n);
+      if (api !== S.api || !cur || cur.seq !== seq) return;
+      S.replies.set(n, { ...cur, loading: false, error: e });
+    } finally {
+      render();
+    }
+  }
+
+  function onReplyToggle(n) {
+    if (S.replyOpen.has(n)) {
+      S.replyOpen.delete(n);
+      render();
+      return;
+    }
+    if (!requireApi()) return;
+    S.replyOpen.add(n);
+    loadReply(n);
+  }
+
+  /** [본문에 반영]: 패널·알림 공용. 답글의 하위 작업을 최신 본문에 추가하고 stuck 을 뗀다. 화면은 반환값으로 즉시 갱신. */
+  async function onApplyReply(n) {
+    if (!requireApi()) return;
+    const entry = S.replies.get(n);
+    const reply = entry && entry.reply;
+    const items = reply && reply.state !== 'working' ? parseReplyChecklist(reply.body) : [];
+    if (!items.length) {
+      showMessage({ tone: 'info', lines: [[issueLink(n), ' 반영할 하위 작업이 없습니다.']] });
+      return;
+    }
+    // 반영에 성공하면 누른 [본문에 반영]은 '이미 반영됨'(비활성)으로 바뀌므로, 키보드 포커스를 같은 자리의 버튼으로 옮긴다
+    // (패널 → [다시 불러오기], 알림 → [답변 보기]).
+    const origin = (document.activeElement && document.activeElement.id) || '';
+    const focusAfter = origin.startsWith('btn-napply-')
+      ? `btn-nview-${n}`
+      : origin.startsWith('btn-apply-')
+        ? { id: null, fkey: `btn-rreload-${n}` }
+        : null;
+    const done = await runIssueAction(n, async () => {
+      let r;
+      try {
+        r = await applyReplySubtasks(S.api, n, items);
+      } catch (e) {
+        // 다른 곳에서 이미 완료된 할 일(409): 목록을 서버 상태로 정리하고 🆘 자동 확인도 멈춘다.
+        if (e instanceof ApiError && e.status === 409 && e.issue && Number.isInteger(e.issue.number)) {
+          upsert(e.issue);
+          stopReplyWatch(n);
+        }
+        throw e;
+      }
+      upsert(r.issue);
+      if (r.added.length) S.expanded.add(n);
+      const k = r.added.length;
+      const m = r.skipped.length;
+      let text = k
+        ? ` 본문에 하위 작업 ${k}개를 반영했습니다${m ? `(이미 있던 ${m}개 제외)` : ''}`
+        : ' 본문에 이미 모든 하위 작업이 있습니다(반영할 항목 없음)';
+      if (r.stuckRemoved) text += ' · stuck 라벨 제거';
+      if (r.stuckError) text += ` · stuck 라벨은 떼지 못했습니다: ${errorText(r.stuckError)}`;
+      showMessage({ tone: r.stuckError ? 'warn' : k ? 'success' : 'info', lines: [[issueLink(n), text]] });
+    });
+    if (done && focusAfter) restoreFocus(focusAfter);
+  }
+
+  /** 알림의 [답변 보기]: 패널을 펼치고 그 위치로 이동(방금 확인한 결과가 있으면 다시 불러오지 않음). */
+  function onNoticeView(n) {
+    if (!requireApi()) return;
+    const issue = S.issues.get(n);
+    if (S.project && issue && !labelNames(issue).includes(`proj:${S.project}`)) setProject(null);
+    S.replyOpen.add(n);
+    const entry = S.replies.get(n);
+    if (!entry || entry.error || Date.now() - entry.at > REPLY_POLL_MS) loadReply(n);
+    else render();
+    const panel = [...els.groups.querySelectorAll('.reply-panel')].find((p) => p.dataset.replyFor === String(n));
+    if (!panel) {
+      showMessage({
+        tone: 'info',
+        lines: [[issueLink(n), ' 은(는) 지금 목록에 없는 항목입니다(완료됐거나 할 일이 아님). 번호를 눌러 GitHub에서 확인하세요.']],
+      });
+      return;
+    }
+    const group = panel.closest('details.group');
+    if (group && !group.open) {
+      group.open = true;
+      const key = group.id.replace(/^group-/, '');
+      S.groupOpen.set(key, true);
+    }
+    let reduce = false;
+    try {
+      reduce = window.matchMedia('(prefers-reduced-motion: reduce)').matches;
+    } catch {
+      reduce = false;
+    }
+    panel.scrollIntoView({ behavior: reduce ? 'auto' : 'smooth', block: 'center' });
+    panel.focus({ preventScroll: true });
+  }
+
+  function stopReplyWatch(n) {
+    const w = S.watch.get(n);
+    if (!w) return;
+    w.stopped = true;
+    if (w.timer !== null) clearTimeout(w.timer);
+    S.watch.delete(n);
+  }
+
+  function stopAllReplyWatches() {
+    for (const n of [...S.watch.keys()]) stopReplyWatch(n);
+  }
+
+  /** 🆘 요청 시각(ISO). 요청 댓글의 created_at(GitHub 시각)을 쓰고, 없으면 이 기기 시각에서 2분 앞. */
+  function sosSince(comment) {
+    const c = comment && typeof comment === 'object' ? comment.created_at : null;
+    if (typeof c === 'string' && Number.isFinite(Date.parse(c))) return c;
+    return new Date(Date.now() - 120000).toISOString();
+  }
+
+  /**
+   * 🆘 후 자동 확인: REPLY_POLL_MS 간격으로 최대 REPLY_WATCH_MS 동안 댓글을 확인한다.
+   * since 이후의 Claude 답글이 'working' 이 아니게 되면 "답변 도착" 알림. 이슈당 타이머 1개(다시 시작하면 이전 것은 멈춤).
+   * 페이지를 닫으면 타이머도 사라진다(재개하지 않음).
+   */
+  function startReplyWatch(n, since) {
+    if (!S.api) return;
+    stopReplyWatch(n);
+    S.notices.delete(n);
+    const w = { since, checks: 0, timer: null, stopped: false, api: S.api };
+    const maxChecks = Math.max(1, Math.floor(REPLY_WATCH_MS / REPLY_POLL_MS));
+    const alive = () => !w.stopped && S.watch.get(n) === w && S.api === w.api;
+    const finish = (notice) => {
+      S.watch.delete(n);
+      if (notice) S.notices.set(n, notice);
+      render();
+    };
+    const tick = async () => {
+      w.timer = null;
+      if (!alive()) return;
+      w.checks += 1;
+      let reply = null;
+      let changed = false;
+      try {
+        const comments = await w.api.listComments(n);
+        if (!alive()) return;
+        S.replies.set(n, replyEntry(comments, ++S.replySeq));
+        changed = setCommentCount(n, comments.length);
+        reply = findClaudeReply(comments, { since: w.since });
+      } catch (e) {
+        if (!alive()) return;
+        if (e instanceof ApiError && [401, 404, 410].includes(e.status)) {
+          finish({ kind: 'error', n, message: errorText(e) });
+          return;
+        }
+      }
+      if (reply && reply.state !== 'working') {
+        finish({ kind: 'arrived', n, state: reply.state });
+        return;
+      }
+      if (w.checks >= maxChecks) {
+        finish({ kind: 'timeout', n });
+        return;
+      }
+      w.timer = setTimeout(tick, REPLY_POLL_MS);
+      if (changed || S.replyOpen.has(n)) render();
+    };
+    S.watch.set(n, w);
+    w.timer = setTimeout(tick, REPLY_POLL_MS);
+  }
+
+  /** 🆘 요청 댓글을 단 직후: 댓글 수 +1(화면), 자동 확인 시작 */
+  function afterSosRequested(n, comment) {
+    const i = S.issues.get(n);
+    if (i) setCommentCount(n, (Number.isSafeInteger(i.comments) && i.comments > 0 ? i.comments : 0) + 1);
+    startReplyWatch(n, sosSince(comment));
   }
 
   function onRecurringDelete(n) {
@@ -1928,6 +2814,10 @@ function boot() {
     S.loadSeq += 1;
     S.expanded.clear();
     S.confirmDelete = null;
+    stopAllReplyWatches();
+    S.replies = new Map();
+    S.replyOpen = new Set();
+    S.notices = new Map();
     clearMessage();
     applyTokenPresence();
     render();
