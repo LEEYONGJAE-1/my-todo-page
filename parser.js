@@ -106,6 +106,47 @@ const P3_PHRASE_RE_G = /(?<![가-힣])(?:시간\s*)?여유\s*(?:있을\s?때|있
 // 독립 단어일 때만 제거. 뒤에 붙은 조사·부사형(언젠가는, 나중에는, 긴급히, 긴급하게)도 함께 제거. '긴급회의' 같은 합성어는 남긴다.
 const PRIORITY_TOKEN_RE_G =
   /(?<![^\s,.(\[!?:])(?:긴급|급함|급하게|asap|언젠가|나중에|여유)(?:은|는|도|히|하게|으로)?(?=$|[\s,.)\]!?:])/gi;
+// 5차 추가 낱말 — 독립 낱말일 때만 인식한다(위 기존 낱말의 부분 문자열 인식은 그대로 둔다).
+//   독립 낱말: 앞이 문장 처음·공백·문장부호(한글·글자·숫자가 아님)이고, 뒤에 한글·글자·숫자가 바로 붙지 않음.
+//   p1: 급한 · 빨리(빨리빨리) · 시급한 · 시급히 · 시급하게 · 시급함
+//   p3: 천천히 · 다음 달(다음달)
+//   '지급한 내역', '월급한도', '조급한 마음', '빨리감기'는 붙어 있는 낱말이라 인식하지 않는다.
+//   맨몸 '시급'(시간당 급여: '알바 시급')과 '중요'(중요 ≠ 급함)는 인식하지 않는다.
+const WORD_EDGE_BEFORE = '(?<![\\p{L}\\p{N}])';
+const WORD_EDGE_AFTER = '(?![\\p{L}\\p{N}])';
+const P1_EXTRA_WORDS = '빨리빨리|빨리|시급하게|시급한|시급히|시급함|급한';
+const P3_EXTRA_WORDS = '천천히';
+const P1_EXTRA_RE = new RegExp(`${WORD_EDGE_BEFORE}(?:${P1_EXTRA_WORDS})${WORD_EDGE_AFTER}`, 'u');
+const P3_EXTRA_RE = new RegExp(`${WORD_EDGE_BEFORE}(?:${P3_EXTRA_WORDS})${WORD_EDGE_AFTER}`, 'u');
+// '다음 달'·'다음달': 뒤는 공백·문장부호·끝, 또는 조사(에·에는·까지·중·중에·안에·쯤) 뒤 비한글.
+// 시점 정보라 제목에 그대로 남기고 마감(Due)도 만들지 않는다(날짜 아님). 다음 단계 구분자 '다음:'(NEXT_SEP_RE)과는 겹치지 않는다.
+const P3_NEXT_MONTH_RE = new RegExp(
+  `${WORD_EDGE_BEFORE}다음\\s?달(?:에는|에|까지|중에|중|안에|쯤)?${WORD_EDGE_AFTER}`,
+  'u'
+);
+// 추가 낱말 제거('다음 달'은 제외 — 제목에 남긴다). 지워도 제목에 문장부호 잔재가 남지 않는 자리에서만 지운다
+// (인식은 위 P1_EXTRA_RE·P3_EXTRA_RE 그대로 — 그 밖의 자리에서는 우선순위만 정하고 제목에 남긴다. 기존 낱말의 '"긴급"'·'#긴급'과 같다):
+//  ① 짝 문장부호가 그 낱말만 감싸면 짝째 지운다: '"빨리" 보고서 작성하기'·'「급한」 …'·'(급한) …' → '보고서 작성'
+//     ('[빨리]'는 프로젝트 [코드] 표기라 지우지 않는다 → 기존 '[긴급]'처럼 프로젝트로 읽힌다)
+//  ② 따로 쓴 낱말: 앞이 문장 처음·공백·뒤에 붙는 문장부호(, . ! ? : ·)이고, 뒤가 끝·공백(또는 아래 문장부호)일 때.
+//     (문장 맨 앞의 '-'·'~'·'/' 바로 뒤도 된다: '-빨리 보고서' → '보고서' — 남은 '-'는 cleanTitle 이 지운다.)
+//     따옴표·괄호·#·/·- 에 붙어 있으면 지우지 않는다: '#빨리 …', '빨리/보고서 …', '보고서 작성(급한 건)하기'는 제목 그대로(p1).
+//  붙어 있는 문장부호도 함께 지워 가운데 잔재를 막는다:
+//  - 뒤 문장부호가 공백·끝 앞이면: '보고서 빨리! 작성하기' → '보고서 작성', '보고서, 빨리, 정리하기' → '보고서, 정리'
+//  - 낱말을 잇는 '·'·','가 바로 글자 앞이면: '천천히·다음 달 정리하기' → '다음 달 정리' ('.'은 '.env' 같은 제목 보호를 위해 제외)
+//  - 글자 바로 뒤에서 낱말을 잇는 '·'·',': '자료 정리·빨리 하기' → '자료 정리' ('정리·' 잔재 방지)
+//  - 바로 뒤의 '!!'(p1 표시)는 따로 지운다: '빨리!!보고서' → '보고서'
+const EXTRA_WORDS = `${P1_EXTRA_WORDS}|${P3_EXTRA_WORDS}`;
+const EXTRA_WRAP_PAIRS = ['()', '（）', '""', "''", '“”', '‘’', '「」', '『』', '<>', '〈〉', '《》'];
+const escapeRe = (ch) => ch.replace(/[\\^$.*+?()[\]{}|/]/g, '\\$&');
+const EXTRA_WRAPPED = EXTRA_WRAP_PAIRS.map(([o, c]) => `${escapeRe(o)}(?:${EXTRA_WORDS})${escapeRe(c)}`).join('|');
+const EXTRA_TOKEN_RE_G = new RegExp(
+  `(?:${EXTRA_WRAPPED})|` +
+    '(?:(?<=[\\p{L}\\p{N}])[·,，])?' +
+    `(?:(?<![^\\s,，.。!！?？:：·])|(?<=^[-–—~/]))(?:${EXTRA_WORDS})` +
+    '(?:[,，!！?？.。~～…:：·]+(?=\\s|$)|[·,，](?=[\\p{L}\\p{N}])|(?=$|\\s|[!！]{2}))',
+  'gu'
+);
 
 // 영역
 const PERSONAL_SUBSTR_RE = /개인|병원|은행/;
@@ -122,6 +163,13 @@ const ORPHAN_TOKENS = new Set(['까지', '까지는', '까지만', '에', '에�
 
 // 완료 대상 매칭에서 떼어볼 조사
 const PARTICLES = new Set(['을', '를', '은', '는', '이', '가', '도', '에', '의', '과', '와']);
+// 완료 대상 매칭에서 '없어도 되는' 낱말: 등록할 때 제목에서 빠지는 우선순위 낱말(긴급·나중에·빨리·급한·천천히 …).
+// '보고서 빨리 작성하기'로 등록하면 제목이 '보고서 작성'이 되므로, '보고서 빨리 작성 완료'도 그 할 일을 바로 찾게 한다.
+// (제목에 그 낱말이 실제로 있으면 다른 낱말처럼 점수에 넣는다. '다음 달'은 제목에 남으므로 해당 없음.)
+const PRIORITY_ONLY_TOKEN_RE = new RegExp(
+  `^(?:(?:긴급|급함|급하게|asap|언젠가|나중에|여유)(?:은|는|도|히|하게|으로)?|${P1_EXTRA_WORDS}|${P3_EXTRA_WORDS})$`,
+  'iu'
+);
 
 // ---------------------------------------------------------------------------
 // 작은 도우미
@@ -192,10 +240,11 @@ function areaOf(text) {
   return 'area:work';
 }
 
+/** 우선순위 판정(할 일 문장·다음 단계 문장 공용). p1·p3 말이 함께 있으면 p1 + conflict. */
 function detectPriority(raw) {
   const s = String(raw ?? '');
-  const p1 = /[!！]{2}/.test(s) || P1_WORD_RE.test(s) || P1_ASAP_RE.test(s);
-  const p3 = P3_WORD_RE.test(s);
+  const p1 = /[!！]{2}/.test(s) || P1_WORD_RE.test(s) || P1_ASAP_RE.test(s) || P1_EXTRA_RE.test(s);
+  const p3 = P3_WORD_RE.test(s) || P3_EXTRA_RE.test(s) || P3_NEXT_MONTH_RE.test(s);
   return { priority: p1 ? 'p1' : p3 ? 'p3' : 'p2', conflict: p1 && p3 };
 }
 
@@ -360,17 +409,40 @@ function resolveDateMatch(kind, m, today) {
   return { due: weekdayInWeek(today, wd, 1), warning: null };
 }
 
+// '다음 달 금요일', '다음 달 첫째 주 화요일'의 요일은 다음 달의 어느 날인지 알 수 없다 — 가장 가까운 요일(이번 주)로
+// 마감을 잡지 않고 제목에 남긴다(경고). '다음 달'은 마감을 만들지 않는다(5차 A). 날짜(11/20, 11월 20일)는 그대로 마감이 된다.
+// 요일 바로 앞 짧은 구간(NEXT_MONTH_WINDOW 글자)만 본다 — 긴 본문 값에서 요일마다 앞부분 전체를 다시 훑지 않게.
+const NEXT_MONTH_BEFORE_WD_RE = /다음\s?달\s*(?:(?:(?:첫|둘|셋|넷|다섯)\s*째|첫|마지막)\s*(?:주\s*)?)?$/;
+const NEXT_MONTH_WINDOW = 24;
+
+/** 요일 매치 m 바로 앞이 '다음 달 (첫째 주 …)'이면 그 구절('다음 달 금요일'), 아니면 null */
+function nextMonthWeekdayPhrase(s, m) {
+  if (m[1]) return null; // '이번 주·다음 주 …' 처럼 주가 정해진 요일은 해당 없음
+  const start = Math.max(0, m.index - NEXT_MONTH_WINDOW);
+  const nm = NEXT_MONTH_BEFORE_WD_RE.exec(s.slice(start, m.index));
+  return nm ? collapse(`${s.slice(start + nm.index, m.index)}${m[2]}요일`) : null;
+}
+
 /**
  * 문장 속 날짜 표현 전부 (위치 순, 겹침 제거). 날짜가 아닌 매치(notDate)는 빼고,
  * 실존하지 않는 날짜(due null + 경고)는 남긴다(호출부가 경고만 내고 건너뛴다).
+ * '다음 달 X요일'은 due null + soft 경고(다른 날짜가 마감이 되면 경고하지 않음).
  */
 function findDates(s, today) {
   const found = [];
   for (const { kind, re } of DATE_PATTERNS) {
     re.lastIndex = 0;
     for (const m of s.matchAll(re)) {
-      const r = resolveDateMatch(kind, m, today);
+      let r = resolveDateMatch(kind, m, today);
       if (r.notDate) continue;
+      const phrase = kind === 'wd' ? nextMonthWeekdayPhrase(s, m) : null;
+      if (phrase) {
+        r = {
+          due: null,
+          soft: true,
+          warning: `"${phrase}"은 어느 날인지 알 수 없어 마감으로 쓰지 않았습니다(마감이 필요하면 날짜로 입력하세요)`,
+        };
+      }
       found.push({ index: m.index, end: m.index + m[0].length, kind, m, ...r });
     }
   }
@@ -396,7 +468,10 @@ function extractCore(text, today, { stripEnd = true, noDue = false } = {}) {
   const pr = detectPriority(raw);
   if (pr.conflict) warnings.push('우선순위 표현이 겹쳐 p1(긴급)으로 정했습니다');
 
-  let s = raw.replace(/[!！]{2,}/g, ' ');
+  // 추가 우선순위어(급한·빨리·시급히·천천히 …)는 인식한 바로 그 문자열(원문)에서 같은 정규식으로 지운다.
+  // 다른 추출(끝 표현 '하기' 등)이 끝난 뒤에 지우면 새로 생긴 경계 때문에 인식하지 않은 낱말까지 지워진다
+  // ('보고서 빨리하기' → 인식 안 함(p2)인데 제목에서 '빨리'가 사라짐). 기존 낱말은 8) 에서 지운다(동작 그대로).
+  let s = raw.replace(EXTRA_TOKEN_RE_G, ' ').replace(/[!！]{2,}/g, ' ');
   s = stripTrailing(s);
 
   // 2) 끝 표현 (조사 정리는 맨 끝에서)
@@ -439,10 +514,13 @@ function extractCore(text, today, { stripEnd = true, noDue = false } = {}) {
     } else {
       // 실존하지 않는 날짜(2/30)는 경고만 내고 제목에 남긴 채 다음 날짜 표현을 쓴다
       const valid = [];
+      const soft = [];
       for (const d of dates) {
         if (d.due) valid.push(d);
+        else if (d.soft) soft.push(d.warning);
         else if (d.warning) warnings.push(d.warning);
       }
+      if (!valid.length) warnings.push(...soft);
       if (valid.length) {
         const d = valid[0];
         s = cut(s, d.index, d.end - d.index);
@@ -881,6 +959,71 @@ export function toggleChecklist(body, { index, text } = {}, checked) {
   return parts.join('');
 }
 
+// 마크다운 제목 줄(# ~ ######)
+const HEADING_LINE_RE = /^ {0,3}#{1,6}(?:[ \t]|$)/;
+
+/**
+ * 본문의 마감(Due) 줄만 바꾼다(홈페이지 [✏ 변경]). due: 'YYYY-MM-DD'(실존 날짜) 또는 null(마감 없음), 그 밖은 TypeError.
+ * 줄 판정은 parseBody 와 같다(CHECK_RE 를 먼저 보고, 체크리스트가 아닌 줄만 BODY_KEY_RE — 대소문자·전각 콜론 포함).
+ * - 바꾸기: parseBody 가 Due 로 읽는 바로 그 줄(첫 `Due:` 키 줄 — 값이 잘못돼 마감이 없던 줄 포함)을 `Due: YYYY-MM-DD` 로.
+ * - 넣기(Due 키 줄이 없을 때): `반복:` 줄 바로 뒤 → 없으면 첫 키 줄(완료 기준·제출·예상·다음·메모) 바로 앞 → 키 줄이 없으면 맨 앞
+ *   (본문이 비었으면 `Due: X` 만, 첫 줄이 `#` 제목이면 사이에 빈 줄 하나). 넣는 줄바꿈은 본문의 첫 줄바꿈 형식(없으면 \n).
+ * - 지우기(null): 그 줄을 줄바꿈째 지운다(빈 줄을 남기지 않음, 마지막 줄이면 앞 줄바꿈을 지움). 없으면 본문 그대로.
+ *   손으로 고친 본문에 `Due:` 키 줄이 여럿이면 뒤 줄이 새로 읽히지 않도록 모두 지운다.
+ * - 그 밖의 줄(회차 표지 `메모: 반복원본: #N / 회차: …`, `다음: … (Due …)`, 하위 작업)과 줄바꿈(\r\n / \n / \r)은 한 글자도 바꾸지 않는다.
+ * 성질: parseBody(setDueInBody(b, d)).due === d 이고 나머지 parseBody 필드는 그대로다. body 가 null·undefined 면 빈 본문으로 본다.
+ */
+export function setDueInBody(body, due) {
+  if (!(due === null || (typeof due === 'string' && isValidYMD(due)))) {
+    throw new TypeError(`마감은 'YYYY-MM-DD'(실존 날짜) 또는 null 이어야 합니다: ${String(due)}`);
+  }
+  const text = body === null || body === undefined ? '' : String(body);
+  // 줄과 줄바꿈 문자를 분리해 보존: [줄, 구분자, 줄, 구분자, ..., 줄] (toggleChecklist 와 같은 방식)
+  const parts = text.split(/(\r\n|\n|\r)/);
+  const dueAt = [];
+  let recurAt = -1;
+  let firstKeyAt = -1;
+  for (let i = 0; i < parts.length; i += 2) {
+    if (CHECK_RE.test(parts[i])) continue;
+    const m = BODY_KEY_RE.exec(parts[i]);
+    if (!m) continue;
+    const key = keyName(m[1]);
+    if (!key) continue;
+    if (firstKeyAt < 0) firstKeyAt = i;
+    if (key === 'due') dueAt.push(i);
+    else if (key === 'recurrence' && recurAt < 0) recurAt = i;
+  }
+
+  if (due === null) {
+    if (!dueAt.length) return text;
+    // 뒤에서부터 지운다(앞쪽 인덱스가 바뀌지 않게)
+    for (let k = dueAt.length - 1; k >= 0; k -= 1) {
+      const i = dueAt[k];
+      if (i + 1 < parts.length) parts.splice(i, 2); // 줄 + 뒤 줄바꿈
+      else if (i > 0) parts.splice(i - 1, 2); // 마지막 줄: 앞 줄바꿈 + 줄
+      else parts.splice(0, 1, ''); // 유일한 줄
+    }
+    return parts.join('');
+  }
+
+  const line = `Due: ${due}`;
+  if (dueAt.length) {
+    parts[dueAt[0]] = line;
+    return parts.join('');
+  }
+  const nl = parts.length > 1 ? parts[1] : '\n';
+  if (recurAt >= 0) {
+    parts.splice(recurAt + 1, 0, nl, line);
+    return parts.join('');
+  }
+  if (firstKeyAt >= 0) {
+    parts.splice(firstKeyAt, 0, line, nl);
+    return parts.join('');
+  }
+  if (text === '') return line;
+  return HEADING_LINE_RE.test(parts[0]) ? `${line}${nl}${nl}${text}` : `${line}${nl}${text}`;
+}
+
 // ---------------------------------------------------------------------------
 // 이슈 도우미
 
@@ -905,6 +1048,37 @@ export function priorityOf(issue) {
   if (names.includes('p2')) return 'p2';
   if (names.includes('p3')) return 'p3';
   return 'p2';
+}
+
+const PRIORITY_LABELS = ['p1', 'p2', 'p3'];
+
+/**
+ * 라벨 이름 배열에서 우선순위 라벨(p1·p2·p3)을 모두 빼고 priority 하나만 넣은 새 배열(홈페이지 [✏ 변경]).
+ * - 다른 라벨은 순서 그대로 둔다. priority 는 원래 첫 p 라벨 자리에, p 라벨이 없었으면 맨 앞(taskLabels 순서)에 넣는다.
+ * - 이름 대신 라벨 객체({name})가 섞여 있어도 이름으로 읽는다. null·undefined 는 빈 배열로 본다. 입력 배열은 바꾸지 않는다.
+ * - priority 가 'p1'|'p2'|'p3' 가 아니면(또는 이름 배열이 배열이 아니면) TypeError.
+ */
+export function withPriorityLabel(names, priority) {
+  if (!PRIORITY_LABELS.includes(priority)) {
+    throw new TypeError(`우선순위는 p1·p2·p3 중 하나여야 합니다: ${String(priority)}`);
+  }
+  if (names !== null && names !== undefined && !Array.isArray(names)) {
+    throw new TypeError('라벨 이름은 배열이어야 합니다');
+  }
+  const out = [];
+  let placed = false;
+  for (const l of names || []) {
+    const name = typeof l === 'string' ? l : l && typeof l.name === 'string' ? l.name : '';
+    if (!name) continue;
+    if (PRIORITY_LABELS.includes(name)) {
+      if (!placed) out.push(priority);
+      placed = true;
+      continue;
+    }
+    out.push(name);
+  }
+  if (!placed) out.unshift(priority);
+  return out;
 }
 
 export function dueOf(issue) {
@@ -976,6 +1150,8 @@ export function matchCandidates(keyword, issues) {
   const long = words.filter((w) => charLen(w) >= 2);
   const tokens = long.length ? long : words;
   if (!tokens.length) return { clear: null, candidates: [] };
+  const edge = (ch) => TOKEN_EDGE.has(ch);
+  const optional = tokens.map((t) => PRIORITY_ONLY_TOKEN_RE.test(trimEndWhile(trimStartWhile(t, edge), edge)));
 
   const candidates = [];
   for (const issue of Array.isArray(issues) ? issues : []) {
@@ -983,19 +1159,22 @@ export function matchCandidates(keyword, issues) {
     if ((issue.state ?? 'open') !== 'open') continue;
     const title = String(issue.title ?? '').toLowerCase().replace(/\s+/g, '');
     let score = 0;
-    for (const t of tokens) {
+    // need: 이 제목이 명확(clear)하려면 맞아야 하는 토큰 수 — 제목에 없는 우선순위 낱말은 빼고 센다
+    let need = tokens.length;
+    tokens.forEach((t, i) => {
       if (title.includes(t)) score += 1;
       // 끝 조사 1개 떼기: 뗀 뒤 2자 이상 남는 토큰(3자 이상)만 — '회의'→'회', '문의'→'문' 같은 1자 어간으로는 점수 없음
       else if (charLen(t) >= 3 && PARTICLES.has(t.slice(-1)) && title.includes(t.slice(0, -1))) score += 1;
-    }
-    if (score > 0) candidates.push({ issue, score });
+      else if (optional[i]) need -= 1;
+    });
+    if (score > 0) candidates.push({ issue, score, need });
   }
   candidates.sort((a, b) => b.score - a.score || (Number(a.issue.number) || 0) - (Number(b.issue.number) || 0));
   let clear = null;
   if (candidates.length) {
     const top = candidates[0].score;
     const tied = candidates.filter((c) => c.score === top).length;
-    if (tied === 1 && top === tokens.length) clear = candidates[0].issue;
+    if (tied === 1 && top === candidates[0].need) clear = candidates[0].issue;
   }
   return { clear, candidates };
 }

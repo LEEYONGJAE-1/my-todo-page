@@ -13,6 +13,7 @@
   --accent-text: #ffffff;
   --accent-soft: #e6f0ff;
   --ok: #1a7f37;
+  --ok-strong: #116329; /* 회색 배경(surface-2) 위 작은 글자용 — 대비 4.5 이상 */
   --warn: #9a5b00;
   --danger: #c62828;
   --danger-hover: #a51f1f;
@@ -42,6 +43,7 @@
     --accent-text: #0b0f14;
     --accent-soft: #1b2a44;
     --ok: #4ac26b;
+    --ok-strong: #4ac26b;
     --warn: #e3b341;
     --danger: #ff7b72;
     --danger-hover: #ffa198;
@@ -977,7 +979,7 @@ tr.is-busy {
 }
 
 .reply-state.st-done {
-  color: var(--ok);
+  color: var(--ok-strong);
 }
 
 .reply-state.st-working {
@@ -1108,6 +1110,149 @@ tr.is-busy {
   margin-top: 8px;
 }
 
+/* [✏ 변경] 우선순위·마감 편집 패널: 그 행 바로 아래 줄(표는 전체 폭 한 칸, 카드는 같은 카드에 붙여 보이게) */
+button.edit-btn[aria-expanded="true"] {
+  border-color: var(--accent);
+  color: var(--accent);
+  font-weight: 700;
+}
+
+@media (min-width: 641px) {
+  table.tasks tr.is-editing > td {
+    padding-bottom: 6px;
+  }
+
+  table.tasks tr.edit-row > td {
+    border-top: 0;
+    padding-top: 0;
+    padding-bottom: 12px;
+  }
+}
+
+.edit-panel {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  max-width: 72ch;
+  padding: 10px 12px;
+  background: var(--surface-2);
+  border: 1px solid var(--border);
+  border-left: 4px solid var(--accent);
+  border-radius: 8px;
+  font-size: 0.92rem;
+}
+
+.edit-panel fieldset {
+  margin: 0;
+  padding: 0;
+  border: 0;
+  min-width: 0;
+}
+
+.edit-panel legend,
+.edit-due-label {
+  padding: 0;
+  font-weight: 700;
+  color: var(--text);
+}
+
+.edit-panel legend {
+  margin-bottom: 4px;
+}
+
+.edit-opts {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+}
+
+.edit-opt {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  min-height: var(--tap);
+  padding: 0 12px 0 10px;
+  background: var(--surface);
+  color: var(--text);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  cursor: pointer;
+  white-space: nowrap;
+}
+
+.edit-opt:hover {
+  border-color: var(--accent);
+}
+
+.edit-opt:has(input:checked) {
+  border-color: var(--accent);
+  box-shadow: inset 0 0 0 1px var(--accent);
+  font-weight: 700;
+}
+
+.edit-opt:has(input:disabled),
+.edit-check:has(input:disabled) {
+  cursor: not-allowed;
+}
+
+.edit-opt input,
+.edit-check input {
+  flex: none;
+  width: 18px;
+  height: 18px;
+  margin: 0;
+  accent-color: var(--accent);
+}
+
+.edit-due {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 6px 12px;
+}
+
+.edit-due-label {
+  margin-right: -4px;
+}
+
+input[type="date"] {
+  font: inherit;
+  font-size: 16px; /* iOS 확대 방지 */
+  color: var(--text);
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  min-height: var(--tap);
+  padding: 0 10px;
+  max-width: 100%;
+  min-width: 0;
+}
+
+input[type="date"]:disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
+}
+
+.edit-check {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  min-height: var(--tap);
+  cursor: pointer;
+  color: var(--text);
+}
+
+.edit-hint {
+  color: var(--muted);
+  font-size: 0.85rem;
+}
+
+.edit-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+}
+
 /* 이번 주 완료 / 반복 목록 */
 .plain-list {
   list-style: none;
@@ -1129,6 +1274,41 @@ tr.is-busy {
   font-size: 0.88rem;
   font-variant-numeric: tabular-nums;
   min-width: 4.8em;
+}
+
+/* 이번 주 완료한 일: 항목별 [지우기](작은 버튼, 오른쪽 끝) */
+.done-list > li {
+  align-items: center;
+}
+
+.done-list .title-text {
+  flex: 1 1 12em;
+  min-width: 0;
+  overflow-wrap: anywhere;
+}
+
+button.mini {
+  min-height: 32px;
+  padding: 0 10px;
+  font-size: 0.85rem;
+}
+
+button.done-hide {
+  margin-left: auto;
+  color: var(--muted);
+  font-weight: 600;
+}
+
+button.done-hide:hover:not(:disabled) {
+  color: var(--text);
+}
+
+.extra-note {
+  margin: 0;
+  padding: 8px 14px 12px;
+  border-top: 1px solid var(--border);
+  color: var(--muted);
+  font-size: 0.85rem;
 }
 
 .recurring-list > li {
@@ -1250,6 +1430,10 @@ tr.is-busy {
     width: 100%;
   }
 
+  button.mini {
+    min-height: 40px;
+  }
+
   .input-form button {
     padding: 0 16px;
   }
@@ -1268,6 +1452,33 @@ tr.is-busy {
   }
 
   .reply-actions button {
+    flex: 1 1 auto;
+  }
+
+  /* [✏ 변경] 패널 줄은 바로 위 카드에 붙여 보이게(구분선·위 여백 없음) */
+  table.tasks tr.edit-row {
+    border-top: 0;
+    padding-top: 0;
+  }
+
+  table.tasks tr.is-editing {
+    padding-bottom: 8px;
+  }
+
+  table.tasks td.c-edit {
+    padding: 0;
+  }
+
+  .edit-panel {
+    padding: 10px;
+    max-width: none;
+  }
+
+  .edit-opt {
+    flex: 1 1 auto;
+  }
+
+  .edit-actions button {
     flex: 1 1 auto;
   }
 }

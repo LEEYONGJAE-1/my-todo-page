@@ -1,6 +1,8 @@
 # my-todo-page
 
-할 일 홈페이지 **What's Next**(GitHub Pages)의 **배포용 사본**입니다. 페이지 코드와 앱 설치용 파일(`manifest.webmanifest`, `icons/`)만 담고 있습니다.
+할 일 홈페이지 **What's Next**(GitHub Pages)의 **배포용 사본**입니다. 페이지 코드, 사용 설명서(`guide.html`·`guide.css`), 앱 설치용 파일(`manifest.webmanifest`, `icons/`)만 담고 있습니다.
+
+- 사용 설명서: https://leeyongjae-1.github.io/my-todo-page/guide.html
 
 - 원본 코드: 비공개 저장소 `my-todo`의 `docs/` (수정은 그곳에서 하고 이 저장소로 복사합니다)
 - 할 일 데이터: 비공개 저장소 `my-todo`의 GitHub Issues. 이 페이지는 각 브라우저에 저장한 토큰으로 GitHub API를 직접 호출합니다.

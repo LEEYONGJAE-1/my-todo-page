@@ -17,6 +17,7 @@ import {
   formatDue,
   formatRecurrence,
   parseRecurrenceValue,
+  isValidYMD,
 } from './dates.js';
 import {
   SOS_COMMENT,
@@ -38,6 +39,9 @@ import {
   isCompletedThisWeek,
   matchCandidates,
   shouldSuggestReplyCheck,
+  setDueInBody,
+  withPriorityLabel,
+  groupsOf,
 } from './parser.js';
 
 // ─────────────────────────────────────────────────────────────
@@ -69,6 +73,7 @@ export const LABEL_DEFS = Object.freeze({
   waiting: labelEntry('f9d0c4', '회신·타인 대기'),
   recurring: labelEntry('006b75', '반복 규칙 원본'),
   briefing: labelEntry('cccccc', '아침 브리핑'),
+  hidden: labelEntry('bfbfbf', '완료 목록에서 숨김'), // 닫힌 이슈 전용: 홈페이지 "이번 주 완료한 일"의 [지우기]
 });
 export const PROJECT_LABEL_DEF = labelEntry('d4c5f9', '프로젝트');
 
@@ -101,6 +106,11 @@ export const MSG = Object.freeze({
   bodyChanged: '본문이 바뀌었습니다. 새로고침 후 다시 시도하세요',
   alreadyClosed: '이미 완료된 할 일입니다(다른 곳에서 처리됨). 목록을 새로고침하세요.',
   applyClosed: '이미 완료된 할 일이라 하위 작업을 반영하지 않았습니다.',
+  hideOpen: '아직 완료되지 않은 할 일은 지울 수 없습니다',
+  hiddenKept: '완료는 됐지만 남아 있던 hidden 라벨(완료 목록에서 숨김)을 떼지 못해 "이번 주 완료한 일" 목록에는 보이지 않습니다. GitHub에서 hidden 라벨을 떼면 다시 보입니다.',
+  metaClosed: '이미 완료된 할 일입니다', // [✏ 변경] 최신 상태가 닫힘(409)
+  metaNotTask: '할 일이 아니라 바꿀 수 없습니다', // [✏ 변경] PR·recurring·briefing(400)
+  metaBadDue: '마감 날짜가 올바르지 않습니다(YYYY-MM-DD)',
   unexpected: '처리 중 예기치 못한 오류가 발생했습니다. 새로고침 후 다시 시도하세요.',
 });
 
@@ -449,6 +459,8 @@ function closeOutcomeUncertain(e) {
  *   - 닫히지 않았음이 확실할 때(4xx 거부, 또는 재조회 결과 open)만 방금 단 완료 댓글을 지우고 오류를 던진다.
  *   - 재조회도 실패하면 댓글은 그대로 두고(닫혔을 수 있으므로) 오류를 던진다.
  * 다음 단계 등록 실패는 완료를 유지하고 nextError(한국어)로 알린다.
+ * 닫은 이슈에 예전 [지우기]의 hidden 라벨이 남아 있으면(다시 연 이슈) 떼어 완료 목록에 보이게 한다(404 무시).
+ * 떼지 못하면 완료는 유지하고 hiddenError(한국어)로 알린다.
  */
 export async function completeIssue(api, issue, today, { labelCache = null } = {}) {
   if (!issue || !Number.isInteger(issue.number)) throw new ApiError('완료할 할 일을 찾을 수 없습니다.', 400);
@@ -491,6 +503,22 @@ export async function completeIssue(api, issue, today, { labelCache = null } = {
   if (!merged.closed_at) merged.closed_at = new Date().toISOString();
   if (merged.state_reason == null) merged.state_reason = 'completed';
 
+  // 예전에 완료 목록에서 지웠다가(hidden) 다시 연 이슈: 이번 완료는 지운 적이 없으므로 남은 hidden 을 떼어 목록에 보이게 한다.
+  let hiddenRemoved = false;
+  let hiddenError = null;
+  if (isHiddenDone(merged)) {
+    try {
+      const labels = await api.removeLabel(n, HIDDEN_LABEL);
+      merged.labels = Array.isArray(labels) ? labels : withoutLabel(merged.labels, HIDDEN_LABEL);
+      hiddenRemoved = true;
+    } catch (e) {
+      if (e instanceof ApiError && e.status === 404) {
+        merged.labels = withoutLabel(merged.labels, HIDDEN_LABEL);
+        hiddenRemoved = true;
+      } else hiddenError = `${MSG.hiddenKept} ${errorText(e)}`;
+    }
+  }
+
   const fields = parseBody(merged.body);
   let nextIssue = null;
   let nextError = null;
@@ -524,6 +552,8 @@ export async function completeIssue(api, issue, today, { labelCache = null } = {
     nextIssue,
     suggestReply: Boolean(shouldSuggestReplyCheck(merged)),
     nextError,
+    hiddenRemoved,
+    hiddenError,
   };
 }
 
@@ -618,6 +648,9 @@ export async function requestDecompose(api, number) {
 // ─────────────────────────────────────────────────────────────
 export const REPLY_POLL_MS = 30 * 1000; // 🆘 후 자동 확인 간격
 export const REPLY_WATCH_MS = 6 * 60 * 1000; // 🆘 후 자동 확인 최대 시간
+// [✏ 변경] 날짜 칸에 입력하는 중이면 자동 확인(화면 다시 그리기)을 이만큼 미룬다 — 다시 그리면 날짜 칸이 새로 만들어져
+// 덜 친 연·월·일이 사라지고 이어 치는 숫자가 엉뚱한 칸에 들어가기 때문
+export const EDIT_DEFER_MS = 1500;
 export const REPLY_MAX_CHARS = 20000; // 화면에 그리는 답글 최대 길이
 export const REPLY_TRUNCATED_TEXT = '…(GitHub에서 전체 보기)';
 export const SAFE_LINK_PREFIX = 'https://github.com/';
@@ -972,6 +1005,200 @@ export function replyBlocks(markdown) {
   return blocks;
 }
 
+// 답글 표시 정리용 (cleanReplyForDisplay)
+// 상태 줄: claude-code-action 머리줄 "**Claude finished …** —— [View job](…)", "**Claude encountered an error after …**",
+// 작성 중 "Claude Code is working…" 류. 'Claude' 로 시작하는 줄만 본다(본문 내용을 지우지 않게).
+const STATUS_LINE_RE = /^\s*(?:\*\*)?\s*Claude(?:\s+Code)?(?:\s+is)?\s*(?:working|finished|encountered\s+an\s+error|(?:가|는)?\s*작업\s*중)/i;
+const TODO_STUCK_RE = /todo-stuck/i;
+// 제목 속 괄호 묶음(한 단계 중첩까지, '(`/todo-stuck` 기준 (가정))' 포함) — 안에 todo-stuck 이 들면 괄호째 지운다
+const HEAD_PAREN_RE = /[(（](?:[^()（）\r\n]|[(（][^()（）\r\n]*[)）])*[)）]/g;
+// 제목 속 대괄호 묶음 '[/todo-stuck 기준]'(링크 '[글](주소)'는 제외)
+const HEAD_BRACKET_RE = /\[[^[\]\r\n]*\](?!\()/g;
+// 명령 표기 토큰: '/todo-stuck', '`/todo-stuck 10`', '/todo-stuck #10', 'todo-stuck 스킬 기준', '/todo-stuck 기준으로'
+const TODO_STUCK_TOKEN_RE =
+  /(?<![\w/-])(?:`\/?todo-stuck(?:[ \t]+#?\d+)?`|\/?todo-stuck(?:[ \t]+#?\d+(?![\w가-힣]))?)(?![\w-])(?:[ \t]+스킬)?(?:[ \t]*기준(?:으로)?(?![\w가-힣]))?/gi;
+const HEADING_PREFIX_RE = /^(\s{0,3}#{1,6}[ \t]+)(.*)$/;
+const STRIP_MARK = '\u0000';
+const STRIP_SPLIT_RE = /\u0000(?:[ \t]*\u0000)*/;
+const HEAD_LEAD_SEP_RE = /^[ \t]*(?:[—–\-:：|·,][ \t]*)*/; // 지운 자리 뒤에 남은 구분자
+const HEAD_TRAIL_SEP_RE = /[ \t]*(?:[—–\-:：|·,][ \t]*)*$/; // 지운 자리 앞에 남은 구분자
+const HEAD_SEP_END_RE = /[—–\-:：|·,]$/;
+const HEAD_SEP_START_RE = /^[—–\-:：|·,]/;
+const NO_SPACE_BEFORE_RE = /^[.,!?。、;:：)）\]」』…]/;
+const TABLE_ROW_RE = /^\s*\|/;
+const ORDERED_ITEM_RE = /^\s*\d+[.)][ \t]/;
+// 안내 문장 '홈페이지 항목의 [본문에 반영]을 누르면 …'(줄 첫머리 — 목록·인용 표시, '참고:' 머리말 허용)
+const GUIDE_LEAD = String.raw`^\s*(?:(?:[-*+]|\d+[.)])[ \t]+|>[ \t]*)*(?:\*\*|__)?[ \t]*(?:(?:참고|안내)[ \t]*(?:\*\*|__)?[ \t]*[:：][ \t]*(?:\*\*|__)?[ \t]*)?`;
+const GUIDE_BUTTON = String.raw`(?:\*\*|__)?\[본문에 반영(?:[ \t]*\(\d+개\))?\](?:\*\*|__)?[ \t]*(?:버튼)?[ \t]*[을를]?[ \t]*누르면`;
+const APPLY_GUIDE_RE = new RegExp(`${GUIDE_LEAD}홈페이지[ \\t]*항목의[ \\t]*${GUIDE_BUTTON}`);
+// '[본문에 반영]을 누르면 … 본문에 추가됩니다'(줄 첫머리) — 본문 내용 문장('… 누르면 아래 하위 작업이 추가되고 …')은 남긴다
+const APPLY_GUIDE_ADDED_RE = new RegExp(`${GUIDE_LEAD}(?:홈페이지(?:에서|의)?[ \\t]*)?${GUIDE_BUTTON}[^\\r\\n]*본문에[ \\t]*추가됩니다`);
+// 문장이 끝난 줄(다음 줄과 한 문장으로 잇지 않음)
+const SENTENCE_END_RE = /(?:[.!?。！？…]|다)["'”’)\]）*_`]*\s*$/;
+
+/**
+ * 제목·굵은 제목 글자에서 /todo-stuck 표기를 지운다: 괄호·대괄호 안에 든 것은 괄호째, 그 밖의 '/todo-stuck'(뒤의 번호·'기준(으로)' 포함) 토큰,
+ * 지운 자리 앞뒤에 남는 구분자(' — ', ':')도 정리한다. '진단 (`/todo-stuck` 기준)' → '진단', '/todo-stuck 진단 — #8' → '진단 — #8',
+ * '진단 — /todo-stuck 기준' → '진단', '🆘 /todo-stuck 진단' → '🆘 진단'. 표기가 없으면 그대로.
+ */
+function stripTodoStuck(text) {
+  const src = String(text);
+  if (!TODO_STUCK_RE.test(src)) return src;
+  const marked = src
+    .replace(HEAD_PAREN_RE, (g, off, s) => (s[off - 1] !== ']' && TODO_STUCK_RE.test(g) ? STRIP_MARK : g))
+    .replace(HEAD_BRACKET_RE, (g) => (TODO_STUCK_RE.test(g) ? STRIP_MARK : g))
+    .replace(TODO_STUCK_TOKEN_RE, STRIP_MARK);
+  if (!marked.includes(STRIP_MARK)) return src;
+  const pieces = marked.split(STRIP_SPLIT_RE);
+  let out = pieces[0];
+  for (let i = 1; i < pieces.length; i += 1) {
+    const raw = pieces[i];
+    const left = out.replace(/[ \t]+$/, '');
+    const right = raw.replace(/^[ \t]+/, '');
+    if (!left.trim()) {
+      out = left + right.replace(HEAD_LEAD_SEP_RE, '');
+    } else if (!right.replace(HEAD_LEAD_SEP_RE, '')) {
+      out = left.replace(HEAD_TRAIL_SEP_RE, '');
+    } else if (HEAD_SEP_END_RE.test(left) && HEAD_SEP_START_RE.test(right)) {
+      out = `${left.replace(HEAD_TRAIL_SEP_RE, '')} ${right}`;
+    } else {
+      const spaced = (left !== out || right !== raw) && !NO_SPACE_BEFORE_RE.test(right);
+      out = left + (spaced ? ' ' : '') + right;
+    }
+  }
+  return out;
+}
+
+// 굵은 제목 바로 뒤에 붙은 표기: '**진단** (`/todo-stuck` 기준)', '**진단** [/todo-stuck]', '**진단** /todo-stuck 기준: …'
+const BOLD_TAIL_ANNOT_RE = new RegExp(`^[ \\t]*(?:${HEAD_PAREN_RE.source}|${HEAD_BRACKET_RE.source}|${TODO_STUCK_TOKEN_RE.source})`, 'i');
+
+/** 굵은 제목 뒤 글자: 표기뿐이면 비우고, 맨 앞에 표기가 붙어 있으면 그것만 뗀다. 그 밖의 본문('… 연다(/todo-stuck 기준 15분).')은 그대로. */
+function stripBoldTail(after) {
+  if (!TODO_STUCK_RE.test(after)) return after;
+  if (!stripTodoStuck(after).replace(HEAD_LEAD_SEP_RE, '').trim()) return '';
+  const a = BOLD_TAIL_ANNOT_RE.exec(after);
+  return a && TODO_STUCK_RE.test(a[0]) ? after.slice(a[0].length) : after;
+}
+
+/** 반영 방법 안내 문장: '홈페이지 항목의 [본문에 반영]을 누르면 …'(줄 첫머리) 또는 'todo-stuck'·'반영해'가 함께 든 것 */
+function isApplyGuidance(text) {
+  const t = String(text);
+  return (TODO_STUCK_RE.test(t) && t.includes('반영해')) || APPLY_GUIDE_RE.test(t) || APPLY_GUIDE_ADDED_RE.test(t);
+}
+
+/**
+ * 🆘 답글을 화면에 보여 주기 전에 정리한다(원문은 바꾸지 않는다 — [본문에 반영]은 원문으로 parseReplyChecklist).
+ * 1) 본문 첫 비어있지 않은 줄이 상태 줄이면 지우고, 바로 뒤(빈 줄 건너) `---` 구분선도 지운다(상태는 패널 머리 배지로 보여 줌).
+ * 2) 제목(#~######)·굵은 제목(줄 첫머리의 **…**)에서 /todo-stuck 표기 제거(stripTodoStuck). 정리 후 비어 버린 제목 줄은 지운다.
+ * 3) 반영 방법 안내 줄 제거('홈페이지 항목의 [본문에 반영]을 누르면 …'으로 시작하는 줄, 'todo-stuck'·'반영해'가 함께 든 줄).
+ *    한 문장이 두 줄로 나뉜 안내(앞 줄이 문장으로 끝나지 않은 일반 문단 줄 2개)는 두 줄을 함께 지운다.
+ *    체크리스트 항목·표(| …) 줄은 건드리지 않고, 번호 목록 줄은 줄 단위로만 본다.
+ * 지운 줄 바로 앞의 빈 줄도 함께 지운다(맨 앞이면 앞뒤의 빈 줄). 코드 블록 안, 그 밖의 줄과 줄바꿈(\r\n/\n)은 그대로 둔다.
+ * 정리할 것이 없으면 입력 문자열을 그대로 돌려준다. 줄 수에 비례하는 시간만 쓴다(긴 답글도 화면을 멈추지 않게).
+ */
+export function cleanReplyForDisplay(body) {
+  const src = body === null || body === undefined ? '' : String(body);
+  const parts = src.split(/(\r\n|\n|\r)/); // [줄, 구분자, 줄, …, 줄]
+  const rows = [];
+  for (let i = 0; i < parts.length; i += 2) rows.push({ text: parts[i], sep: parts[i + 1] ?? '', kind: 'text', drop: false });
+
+  // 줄 종류(replyBlocks 와 같은 순서로 판정 + 표 줄·번호 목록 줄 구분)
+  let fence = null;
+  for (const r of rows) {
+    const f = FENCE_RE.exec(r.text);
+    if (f && (!fence || f[1][0] === fence)) {
+      fence = fence ? null : f[1][0];
+      r.kind = 'fence';
+    } else if (fence) r.kind = 'code';
+    else if (!r.text.trim()) r.kind = 'blank';
+    else if (MD_HR_RE.test(r.text)) r.kind = 'hr';
+    else if (MD_HEADING_RE.test(r.text)) r.kind = 'heading';
+    else if (MD_QUOTE_RE.test(r.text)) r.kind = 'quote';
+    else if (MD_CHECK_RE.test(r.text)) r.kind = 'check';
+    else if (MD_BULLET_RE.test(r.text)) r.kind = 'bullet';
+    else if (TABLE_ROW_RE.test(r.text)) r.kind = 'table';
+    else if (ORDERED_ITEM_RE.test(r.text)) r.kind = 'olist';
+  }
+  const blank = (r) => r.kind === 'blank';
+  let changed = false;
+
+  // 1) 상태 줄 + 바로 뒤 구분선
+  const first = rows.findIndex((r) => !blank(r));
+  if (first >= 0 && rows[first].kind === 'text' && STATUS_LINE_RE.test(rows[first].text)) {
+    rows[first].drop = true;
+    const next = rows.findIndex((r, i) => i > first && !blank(r));
+    if (next >= 0 && rows[next].kind === 'hr') rows[next].drop = true;
+    changed = true;
+  }
+
+  // 2) 제목·굵은 제목 줄의 /todo-stuck 표기
+  for (const r of rows) {
+    if (r.drop || !TODO_STUCK_RE.test(r.text)) continue;
+    if (r.kind === 'heading') {
+      const m = HEADING_PREFIX_RE.exec(r.text);
+      const rest = stripTodoStuck(m[2]);
+      if (rest !== m[2]) {
+        r.text = m[1] + rest;
+        if (!rest.replace(/[#*_\s]/g, '')) r.drop = true;
+        changed = true;
+      }
+    } else if (r.kind === 'text') {
+      const m = BOLD_LINE_RE.exec(r.text);
+      if (!m) continue;
+      const inner = stripTodoStuck(m[1]); // 굵은 제목 부분
+      const after = r.text.slice(m[0].length);
+      const tail = stripBoldTail(after); // 굵은 제목 바로 뒤의 표기만(뒤 본문은 그대로)
+      if (inner === m[1] && tail === after) continue;
+      const lead = r.text.slice(0, r.text.indexOf('**'));
+      if (inner.replace(/[*_\s]/g, '')) r.text = `${lead}**${inner}**${tail}`;
+      else {
+        const rest = tail.replace(HEAD_LEAD_SEP_RE, '');
+        if (rest.replace(/[*_\s]/g, '')) r.text = lead + rest;
+        else r.drop = true;
+      }
+      changed = true;
+    }
+  }
+
+  // 3) 반영 방법 안내: 줄 단위(문단·목록·번호 목록·인용), 두 줄로 나뉜 한 문장(일반 문단 줄)
+  for (const r of rows) {
+    if (!r.drop && ['text', 'bullet', 'quote', 'olist'].includes(r.kind) && isApplyGuidance(r.text)) {
+      r.drop = true;
+      changed = true;
+    }
+  }
+  for (let i = 0; i + 1 < rows.length; i += 1) {
+    const a = rows[i];
+    const b = rows[i + 1];
+    if (a.drop || b.drop || a.kind !== 'text' || b.kind !== 'text' || SENTENCE_END_RE.test(a.text)) continue;
+    if (isApplyGuidance(`${a.text.trim()} ${b.text.trim()}`)) {
+      a.drop = true;
+      b.drop = true;
+      changed = true;
+      i += 1;
+    }
+  }
+  if (!changed) return src;
+
+  // 지운 줄 주변의 빈 줄 정리: 앞에 남은 내용이 있으면 바로 앞 빈 줄들을, 없으면(맨 앞) 앞뒤의 빈 줄들을 함께 지운다.
+  let lastContent = -1; // 남는 내용 줄의 마지막 위치
+  let swept = -1; // 여기까지 앞쪽 빈 줄 정리함
+  for (let i = 0; i < rows.length; i += 1) {
+    const r = rows[i];
+    if (!r.drop) {
+      if (!blank(r)) lastContent = i;
+      continue;
+    }
+    for (let k = Math.max(lastContent, swept) + 1; k < i; k += 1) rows[k].drop = true;
+    swept = i;
+    if (lastContent < 0) {
+      for (let k = i + 1; k < rows.length && blank(rows[k]) && !rows[k].drop; k += 1) rows[k].drop = true;
+    }
+  }
+  const kept = rows.filter((r) => !r.drop);
+  return kept.map((r, i) => (i === kept.length - 1 ? r.text : r.text + r.sep)).join('');
+}
+
 /**
  * [본문에 반영]: 최신 이슈 GET → mergeSubtasksIntoBody → 추가할 항목이 있을 때만 PATCH body
  * → (최신 라벨에) stuck 이 있으면 제거(404 무시).
@@ -1034,6 +1261,183 @@ export async function toggleWaiting(api, issue, opts = {}) {
       : cur.filter((l) => (typeof l === 'string' ? l : l && l.name) !== 'waiting');
   }
   return { ...issue, labels };
+}
+
+// ─────────────────────────────────────────────────────────────
+// 이번 주 완료한 일 [지우기] = `hidden` 라벨(닫힌 이슈 전용). 이슈·기록은 GitHub 에 남고 라벨을 떼면 다시 보인다.
+// ─────────────────────────────────────────────────────────────
+export const HIDDEN_LABEL = 'hidden';
+
+/** 완료 목록에서 숨긴 이슈인지: 라벨 이름이 정확히 'hidden'. (열린 할 일 목록·개수·그룹에는 쓰지 않는다) */
+export function isHiddenDone(issue) {
+  return labelNames(issue).includes(HIDDEN_LABEL);
+}
+
+const withoutLabel = (labels, name) =>
+  (Array.isArray(labels) ? labels : []).filter((l) => (typeof l === 'string' ? l : l && l.name) !== name);
+
+/**
+ * [지우기]: 최신 상태 확인(GET) → 열려 있으면 ApiError(409, MSG.hideOpen)(오류의 issue 에 최신 이슈)
+ * → ensureLabels(['hidden']) → addLabels(n, ['hidden']) → 라벨이 반영된 issue 반환.
+ * 이미 hidden 이면 쓰지 않고 최신 이슈를 돌려준다.
+ */
+export async function hideDone(api, issue, opts = {}) {
+  if (!issue || !Number.isInteger(issue.number)) throw new ApiError('지울 할 일을 찾을 수 없습니다.', 400);
+  const n = issue.number;
+  const latest = await api.getIssue(n);
+  if (!latest || typeof latest !== 'object') throw new ApiError(MSG.badResponse, 0);
+  if (latest.state !== 'closed') throw new ApiError(MSG.hideOpen, 409, { issue: latest });
+  const merged = { ...issue, ...latest };
+  if (isHiddenDone(latest)) return merged;
+  await ensureLabels(api, [HIDDEN_LABEL], (opts && opts.labelCache) || null);
+  const labels = await api.addLabels(n, [HIDDEN_LABEL]);
+  return {
+    ...merged,
+    labels: Array.isArray(labels) ? labels : [...withoutLabel(merged.labels, HIDDEN_LABEL), { name: HIDDEN_LABEL }],
+  };
+}
+
+/** [지우기] 되돌리기: removeLabel(n, 'hidden')(404 = 이미 없음, 무시) → 라벨이 반영된 issue 반환. */
+export async function unhideDone(api, issue) {
+  if (!issue || !Number.isInteger(issue.number)) throw new ApiError('되돌릴 할 일을 찾을 수 없습니다.', 400);
+  let labels = null;
+  try {
+    labels = await api.removeLabel(issue.number, HIDDEN_LABEL);
+  } catch (e) {
+    if (!(e instanceof ApiError && e.status === 404)) throw e;
+  }
+  return { ...issue, labels: Array.isArray(labels) ? labels : withoutLabel(issue.labels, HIDDEN_LABEL) };
+}
+
+// ─────────────────────────────────────────────────────────────
+// [✏ 변경] 우선순위·마감 바꾸기: p 라벨을 하나로 바꾸고(나머지 라벨 유지) 본문 `Due:` 줄만 고친다(다른 줄·회차 표지 유지).
+// ─────────────────────────────────────────────────────────────
+const PRIORITY_KEYS = Object.freeze(['p1', 'p2', 'p3']);
+/** 편집 패널 라디오·결과 메시지의 우선순위 이름: 'p1 긴급' / 'p1(긴급)' */
+export const PRIORITY_TEXT = Object.freeze({ p1: '긴급', p2: '이번 주', p3: '나중에' });
+/** [✏ 변경] 화면 문구(설명서와 맞춘다). 결과 문장은 metaChangeText 가 만든다. */
+export const META_TEXT = Object.freeze({
+  hint: '목록 위치는 마감일에도 따라 정해집니다: 마감이 지나면 🔴 지연, 오늘·내일이면 🟠 긴급, 7일 이내면 🟡 이번 주.',
+  noChange: '바뀐 내용이 없습니다',
+  dueRemoved: '마감을 없앴습니다',
+  pastDue: '이미 지난 날짜라 🔴 지연에 표시됩니다',
+  waitingStays: '대기 중인 할 일이라 ⏳ 대기 중에 그대로 표시됩니다(대기를 해제하면 우선순위·마감에 따라 옮겨집니다).',
+  alreadySame: '다른 곳에서 이미 같은 값으로 바뀌어 있어 목록만 최신으로 고쳤습니다.',
+  listUpdated: '목록을 GitHub의 최신 상태로 고쳤습니다. 다른 항목도 바뀌었을 수 있으니 [목록 새로고침]을 누르세요.',
+  needDate: '마감 날짜를 고르거나 [마감 없음]을 체크하세요.',
+  badDate: '마감 날짜가 올바르지 않습니다. 날짜를 다시 고르세요.',
+});
+
+/**
+ * [✏ 변경] 마감으로 받는 날짜 범위(편집 패널 날짜 칸의 min·max 와 같다). 키보드로 연도를 덜 친 값(0202-10-30)이나
+ * 연·월·일 순서를 잘못 친 값(1030-02-02)이 그대로 본문에 들어가지 않게 저장 전에 막는다.
+ */
+export const DUE_MIN = '2000-01-01';
+export const DUE_MAX = '2999-12-31';
+/** 'YYYY-MM-DD' 이고 DUE_MIN~DUE_MAX 안이면 true */
+export function isDueInRange(due) {
+  return typeof due === 'string' && isValidYMD(due) && due >= DUE_MIN && due <= DUE_MAX;
+}
+
+/** 'p1' → 'p1(긴급)' (결과 메시지용) */
+export function priorityText(p) {
+  const k = PRIORITY_KEYS.includes(p) ? p : 'p2';
+  return `${k}(${PRIORITY_TEXT[k]})`;
+}
+
+/**
+ * [✏ 변경]: 우선순위(p 라벨)·마감(본문 `Due:` 줄)을 PATCH 한 번으로 바꾼다.
+ * change.priority: 'p1'|'p2'|'p3'|undefined(그대로), change.due: 'YYYY-MM-DD'|null(마감 없음)|undefined(그대로).
+ * 1) 최신 상태 GET — 닫혀 있으면 ApiError(409, '이미 완료된 할 일입니다'),
+ *    할 일이 아니면(PR·recurring·briefing) ApiError(400, '할 일이 아니라 바꿀 수 없습니다'). 두 오류 모두 issue 에 최신 이슈를 담는다.
+ * 2) 바꿀 것 계산(최신 기준): 라벨 = priority 가 주어지고 priorityOf(최신)와 다르거나 p 라벨이 1개가 아니면(2개 이상·없음) withPriorityLabel.
+ *    본문 = due 가 주어지고 parseBody(최신).due 와 다르면 setDueInBody(Due 줄만 바꾸기·넣기·지우기).
+ * 3) 바꿀 것이 없으면 쓰지 않고 { issue: 최신, changed: [] }.
+ * 4) 라벨을 바꾸면 먼저 ensureLabels([priority]).
+ * 5) PATCH 한 번(api.updateIssue(n, { labels?, body? })) → { issue: 응답, changed: ['priority'?, 'due'?] }.
+ *    GitHub REST 의 PATCH labels 는 이슈 라벨 전체를 그 배열로 바꾼다 → 다른 라벨(area·proj·waiting·stuck 등)도 최신 순서 그대로 넣는다.
+ * 값이 잘못되면(p4, '2026-02-30', 범위(DUE_MIN~DUE_MAX) 밖의 '0202-10-30' 등) 요청 없이 ApiError(400).
+ */
+export async function updateTaskMeta(api, issue, change = {}, opts = {}) {
+  const num = typeof issue === 'number' ? issue : issue && typeof issue === 'object' ? issue.number : null;
+  if (!Number.isSafeInteger(num) || num <= 0) throw new ApiError('바꿀 할 일을 찾을 수 없습니다.', 400);
+  const { priority, due } = change && typeof change === 'object' ? change : {};
+  if (priority !== undefined && !PRIORITY_KEYS.includes(priority)) {
+    throw new ApiError(`우선순위는 p1·p2·p3 중 하나여야 합니다: ${String(priority)}`, 400);
+  }
+  if (due !== undefined && due !== null && !isDueInRange(due)) {
+    throw new ApiError(`${MSG.metaBadDue}: ${String(due)}`, 400);
+  }
+  const latest = await api.getIssue(num);
+  if (!latest || typeof latest !== 'object') throw new ApiError(MSG.badResponse, 0);
+  if (latest.state === 'closed') throw new ApiError(MSG.metaClosed, 409, { issue: latest });
+  if (!isTask(latest)) throw new ApiError(MSG.metaNotTask, 400, { issue: latest });
+
+  const names = labelNames(latest);
+  const pCount = names.filter((x) => PRIORITY_KEYS.includes(x)).length;
+  const patch = {};
+  const changed = [];
+  if (priority !== undefined && (priorityOf(latest) !== priority || pCount !== 1)) {
+    patch.labels = withPriorityLabel(names, priority);
+    changed.push('priority');
+  }
+  const body = typeof latest.body === 'string' ? latest.body : '';
+  if (due !== undefined && parseBody(body).due !== due) {
+    const next = setDueInBody(body, due);
+    if (next !== body) {
+      patch.body = next;
+      changed.push('due');
+    }
+  }
+  if (!changed.length) return { issue: latest, changed };
+
+  if (patch.labels) await ensureLabels(api, [priority], (opts && opts.labelCache) || null);
+  const updated = await api.updateIssue(num, patch);
+  const result =
+    updated && typeof updated === 'object'
+      ? updated
+      : {
+          ...latest,
+          ...(patch.labels ? { labels: patch.labels.map((name) => ({ name })) } : {}),
+          ...(patch.body !== undefined ? { body: patch.body } : {}),
+        };
+  return { issue: result, changed };
+}
+
+/**
+ * 날짜 표시('10/20(화) · D-16') 뒤에 붙일 조사 '로'/'으로'. 끝이 숫자면 읽는 소리의 받침으로 고른다:
+ * 0(십·백·천·만 …)·3(삼)·6(육) → '으로', 1(일)·7(칠)·8(팔)(ㄹ 받침)·2·4·5·9 → '로'. 'D-day'(데이) 등 그 밖은 '로'.
+ */
+export function roParticle(text) {
+  const last = String(text ?? '').trim().slice(-1);
+  return '036'.includes(last) && last !== '' ? '으로' : '로';
+}
+
+/**
+ * [✏ 변경] 결과 문장(번호 뒤에 붙인다). 날짜는 마감 칸과 같은 formatDue('10/20(화) · D-6'), 조사는 roParticle.
+ * '우선순위를 p1(긴급)로, 마감을 10/20(화) · D-5로 바꿨습니다' / '우선순위를 p1(긴급)로 바꿨습니다' / '마감을 10/30(금) · D-16으로 바꿨습니다'
+ * / '마감을 없앴습니다' / '우선순위를 p1(긴급)로 바꾸고 마감을 없앴습니다' / (바뀐 것 없음) '바뀐 내용이 없습니다'
+ */
+export function metaChangeText(issue, changed, today) {
+  const list = Array.isArray(changed) ? changed : [];
+  const prio = list.includes('priority') ? priorityText(priorityOf(issue)) : null;
+  const dueChanged = list.includes('due');
+  if (!prio && !dueChanged) return META_TEXT.noChange;
+  const due = dueChanged ? parseBody(issue && issue.body).due : null;
+  const dueShown = due ? formatDue(due, today) : '';
+  const dueText = due ? `마감을 ${dueShown}${roParticle(dueShown)}` : null;
+  if (prio && dueChanged) return due ? `우선순위를 ${prio}로, ${dueText} 바꿨습니다` : `우선순위를 ${prio}로 바꾸고 ${META_TEXT.dueRemoved}`;
+  if (prio) return `우선순위를 ${prio}로 바꿨습니다`;
+  return due ? `${dueText} 바꿨습니다` : META_TEXT.dueRemoved;
+}
+
+/** [✏ 변경] 결과에 덧붙일 안내: 마감이 지났으면 '이미 지난 날짜라 🔴 지연에 표시됩니다', (지나지 않은) 대기 중이면 그대로 ⏳ 대기 중. */
+export function metaChangeNotes(issue, changed, today) {
+  if (!Array.isArray(changed) || !changed.length) return [];
+  const due = parseBody(issue && issue.body).due;
+  if (due && due < today) return [META_TEXT.pastDue];
+  if (labelNames(issue).includes('waiting')) return [META_TEXT.waitingStays];
+  return [];
 }
 
 /** 체크박스 1개 토글: 최신 본문 GET → toggleChecklist → PATCH. 항목을 못 찾으면 409 ApiError. */
@@ -1288,7 +1692,9 @@ function boot() {
     replySeq: 0,
     watch: new Map(), // number → 🆘 후 자동 확인 상태(이슈당 타이머 1개)
     notices: new Map(), // number → 🆘 답변 도착/시간 초과 알림
+    edits: new Map(), // number → [✏ 변경] 편집 패널 상태 {group, origPriority, origDue, priority, due, noDue, lastDue}
   };
+  let editAt = new Map(); // number → 편집 패널을 그리는 그룹(같은 이슈가 🔴·⏳ 두 그룹에 있어도 패널은 한 곳)
   let msgState = null;
   let undoTimer = null;
   let noticeSig = '';
@@ -1297,6 +1703,7 @@ function boot() {
   const issueKey = (n) => `issue:${n}`;
   const openIssues = () => [...S.issues.values()].filter((i) => i.state !== 'closed' && !i.pull_request);
   const matchesProject = (i) => !S.project || labelNames(i).includes(`proj:${S.project}`);
+  // 이번 주 완료(상단 "이번 주 완료 n건" 개수용 — [지우기]로 숨긴 것도 센다)
   const completedList = (today) =>
     [...S.issues.values()]
       .filter((i) => i.state === 'closed' && !i.pull_request && isTask(i) && isCompletedThisWeek(i, today) && matchesProject(i))
@@ -1305,6 +1712,15 @@ function boot() {
     [...S.issues.values()]
       .filter((i) => i.state !== 'closed' && !i.pull_request && labelNames(i).includes('recurring') && matchesProject(i))
       .sort((a, b) => a.number - b.number);
+
+  /**
+   * 라벨만 바꾼 결과(라벨 API 응답에는 updated_at 이 없음)가 새로고침 때 지연된 목록 응답(최대 약 60초)에 밀리지 않도록
+   * 로컬 사본의 updated_at 을 지금 시각으로 올린다(더 새로운 서버 응답이 오면 그것이 이긴다).
+   */
+  function touchLocal(issue) {
+    const now = Date.now();
+    return timeOf(issue && issue.updated_at) >= now ? issue : { ...issue, updated_at: new Date(now).toISOString() };
+  }
 
   /** API 응답 객체로 메모리 상태를 즉시 갱신(재조회하지 않음). */
   function upsert(issue, { local = true } = {}) {
@@ -1453,6 +1869,18 @@ function boot() {
       return;
     }
     const g = groupIssues(openIssues(), today, { project: S.project });
+    // [✏ 변경] 패널: 닫혔거나 할 일이 아니게 된 항목의 편집 상태는 버린다. 패널은 연 그룹에(그 그룹에 없으면 첫 그룹에) 하나만 그린다.
+    editAt = new Map();
+    for (const [n, d] of [...S.edits]) {
+      const i = S.issues.get(n);
+      if (!i || i.state === 'closed' || !isTask(i)) {
+        S.edits.delete(n);
+        continue;
+      }
+      const inGroup = (k) => (g[k] || []).some((x) => x.number === n);
+      const k = inGroup(d.group) ? d.group : GROUPS.map((x) => x.key).find(inGroup);
+      if (k) editAt.set(n, k);
+    }
     els.groups.replaceChildren(...GROUPS.map((d) => renderGroup(d, g[d.key] || [], today)));
   }
 
@@ -1476,7 +1904,13 @@ function boot() {
     if (empty) {
       details.append(el('p', { class: 'empty' }, '없음'));
     } else {
-      const tbody = el('tbody', null, items.map((issue) => renderRow(issue, def.key, today)));
+      const tbody = el(
+        'tbody',
+        null,
+        items.map((issue) =>
+          editAt.get(issue.number) === def.key ? [renderRow(issue, def.key, today), renderEditRow(issue, def.key)] : renderRow(issue, def.key, today),
+        ),
+      );
       details.append(
         el(
           'div',
@@ -1554,6 +1988,7 @@ function boot() {
     const replyOpen = S.replyOpen.has(n);
     const showReply = comments > 0 || sosSent || replyOpen || S.watch.has(n) || S.replies.has(n);
     const replyLabel = replyOpen ? '💬 답변 닫기' : '💬 답변 보기';
+    const editOpen = editAt.get(n) === groupKey;
     const actions = el(
       'td',
       { class: 'c-actions', 'data-label': '작업' },
@@ -1589,6 +2024,21 @@ function boot() {
           'button',
           {
             type: 'button',
+            class: 'edit-btn',
+            id: `btn-edit-${groupKey}-${n}`,
+            dataset: { fkey: `btn-edit-${n}` },
+            disabled: busy,
+            'aria-expanded': String(editOpen),
+            'aria-controls': editOpen ? `edit-${groupKey}-${n}` : null,
+            'aria-label': editOpen ? `✏ 닫기(우선순위·마감 변경): #${n} ${title}` : `✏ 우선순위·마감 변경: #${n} ${title}`,
+            onclick: () => onEditToggle(n, groupKey),
+          },
+          editOpen ? '✏ 닫기' : '✏ 변경',
+        ),
+        el(
+          'button',
+          {
+            type: 'button',
             class: 'sos',
             id: `btn-sos-${groupKey}-${n}`,
             dataset: { fkey: `btn-sos-${n}` },
@@ -1619,7 +2069,7 @@ function boot() {
 
     return el(
       'tr',
-      { class: `task prio-${prio}${busy ? ' is-busy' : ''}`, 'aria-busy': busy ? 'true' : null },
+      { class: `task prio-${prio}${busy ? ' is-busy' : ''}${editOpen ? ' is-editing' : ''}`, 'aria-busy': busy ? 'true' : null },
       titleCell,
       cell('마감', due ? formatDue(due, today) : '', dueCls),
       cell('제출', f.submitTo, 'c-field c-submit'),
@@ -1699,6 +2149,134 @@ function boot() {
     return wrap;
   }
 
+  // ── [✏ 변경] 우선순위·마감 편집 패널 (행 아래 한 줄) ──────
+  /**
+   * 편집 패널은 S.edits 의 상태로 매번 다시 그린다(🆘 답변 패널처럼 render() 를 거쳐도 열림·입력값이 유지된다).
+   * 입력 요소마다 id(그룹 포함)와 data-fkey(그룹 무관)를 두어 다시 그린 뒤에도 키보드 포커스가 제자리로 돌아온다.
+   */
+  function renderEditRow(issue, groupKey) {
+    const n = issue.number;
+    const d = S.edits.get(n);
+    if (!d) return null;
+    const busy = S.busy.has(issueKey(n));
+    const sfx = `${groupKey}-${n}`;
+    const hintId = `edit-hint-${sfx}`;
+    const dateId = `edit-due-${sfx}`;
+    const noDueId = `edit-nodue-${sfx}`;
+
+    const radios = PRIORITY_KEYS.map((p) => {
+      const id = `edit-${p}-${sfx}`;
+      const input = el('input', {
+        type: 'radio',
+        name: `edit-prio-${sfx}`,
+        id,
+        value: p,
+        dataset: { fkey: `edit-${p}-${n}` },
+        checked: d.priority === p,
+        disabled: busy,
+      });
+      input.addEventListener('change', () => {
+        if (input.checked) d.priority = p;
+      });
+      return el('label', { class: 'edit-opt', for: id }, input, ' ', el('span', { class: `badge prio prio-${p}` }, p), ` ${PRIORITY_TEXT[p]}`);
+    });
+
+    const date = el('input', {
+      type: 'date',
+      id: dateId,
+      class: 'edit-date',
+      dataset: { fkey: `edit-due-${n}` },
+      value: d.noDue ? '' : d.due,
+      min: DUE_MIN,
+      max: DUE_MAX,
+      disabled: busy || d.noDue,
+    });
+    const syncDate = () => {
+      d.due = date.value;
+    };
+    date.addEventListener('input', syncDate);
+    date.addEventListener('change', syncDate);
+    const noDue = el('input', { type: 'checkbox', id: noDueId, dataset: { fkey: `edit-nodue-${n}` }, checked: d.noDue, disabled: busy });
+    noDue.addEventListener('change', () => {
+      d.noDue = noDue.checked;
+      if (d.noDue) {
+        // 체크하면 날짜 입력을 비우고 막는다(체크를 풀면 직전 날짜 → 원래 마감 순으로 되살린다)
+        if (d.due) d.lastDue = d.due;
+        d.due = '';
+        date.value = '';
+        date.disabled = true;
+      } else {
+        date.disabled = false;
+        if (!d.due) {
+          d.due = d.lastDue || d.origDue || '';
+          date.value = d.due;
+        }
+      }
+    });
+
+    const form = el(
+      'form',
+      {
+        class: 'edit-panel',
+        id: `edit-${sfx}`,
+        dataset: { editFor: n },
+        'aria-label': `#${n} 우선순위·마감 변경`,
+        'aria-describedby': hintId,
+        'aria-busy': busy ? 'true' : null,
+        autocomplete: 'off',
+        novalidate: true, // 날짜 확인은 브라우저 말풍선 대신 앱 메시지로(onEditSave)
+      },
+      el('fieldset', { class: 'edit-prio' }, el('legend', null, '우선순위'), el('div', { class: 'edit-opts' }, radios)),
+      el(
+        'div',
+        { class: 'edit-due' },
+        el('label', { class: 'edit-due-label', for: dateId }, '마감'),
+        date,
+        el('label', { class: 'edit-check', for: noDueId }, noDue, ' 마감 없음'),
+      ),
+      el('p', { class: 'edit-hint', id: hintId }, META_TEXT.hint),
+      el(
+        'div',
+        { class: 'edit-actions' },
+        el(
+          'button',
+          {
+            type: 'submit',
+            class: 'primary',
+            id: `btn-esave-${sfx}`,
+            dataset: { fkey: `btn-esave-${n}` },
+            disabled: busy,
+            'aria-label': `${busy ? '저장 중…' : '저장'}: #${n} 우선순위·마감 변경`,
+          },
+          busy ? '저장 중…' : '저장',
+        ),
+        el(
+          'button',
+          {
+            type: 'button',
+            id: `btn-ecancel-${sfx}`,
+            dataset: { fkey: `btn-ecancel-${n}` },
+            disabled: busy,
+            'aria-label': `취소: #${n} 우선순위·마감 변경`,
+            onclick: () => onEditCancel(n),
+          },
+          '취소',
+        ),
+      ),
+    );
+    form.addEventListener('submit', (e) => {
+      e.preventDefault(); // 페이지 이동 없음(CSP form-action 'none')
+      onEditSave(n);
+    });
+    form.addEventListener('keydown', (e) => {
+      if (e.key === 'Escape' && !e.isComposing) {
+        e.preventDefault();
+        onEditCancel(n);
+      }
+    });
+    return el('tr', { class: 'edit-row' }, el('td', { class: 'c-edit', colspan: String(COLUMNS.length) }, form));
+  }
+
   // ── 🆘 Claude 답변 패널 ───────────────────────────────
   function renderInline(segs) {
     return (segs || []).map((sg) => {
@@ -1761,7 +2339,7 @@ function boot() {
     if (!S.replyOpen.has(n)) return null;
     const entry = S.replies.get(n) || { loading: true, error: null, reply: null, latest: null };
     const reply = entry.reply;
-    const head = el('div', { class: 'reply-head' }, el('strong', { class: 'reply-title' }, 'Claude 답변'));
+    const head = el('div', { class: 'reply-head' }, el('strong', { class: 'reply-title' }, '답변'));
     if (reply) {
       head.append(el('span', { class: `reply-state st-${reply.state}` }, REPLY_STATE_TEXT[reply.state] || '완료'));
       const when = dateTimeText(reply.updated_at || reply.created_at);
@@ -1788,7 +2366,8 @@ function boot() {
       if (reply.state === 'working') kids.push(el('p', { class: 'reply-note' }, 'Claude가 답변을 작성하고 있습니다. 잠시 뒤 [다시 불러오기]를 누르세요.'));
       if (reply.state === 'error') kids.push(el('p', { class: 'reply-note st-error' }, 'Claude 실행이 오류로 끝났습니다. 아래 내용이 완전하지 않을 수 있습니다.'));
       if (reply.stale) kids.push(el('p', { class: 'reply-note' }, '이 답변은 20분 넘게 바뀌지 않아 실행이 끝난 것으로 봅니다. 내용이 완전하지 않을 수 있습니다.'));
-      kids.push(el('div', { class: 'reply-body' }, renderReplyBlocks(replyBlocks(reply.body))));
+      // 표시용 정리(상태 줄·/todo-stuck 표기·반영 안내 줄 제거). [본문에 반영]은 원문(reply.body)으로 계산한다.
+      kids.push(el('div', { class: 'reply-body' }, renderReplyBlocks(replyBlocks(cleanReplyForDisplay(reply.body)))));
       const info = applyInfo(issue, reply);
       kids.push(
         el(
@@ -1831,7 +2410,7 @@ function boot() {
     }
     return el(
       'section',
-      { class: 'reply-panel', id: `reply-${groupKey}-${n}`, dataset: { replyFor: n }, tabindex: '-1', 'aria-label': `#${n} Claude 답변` },
+      { class: 'reply-panel', id: `reply-${groupKey}-${n}`, dataset: { replyFor: n }, tabindex: '-1', 'aria-label': `#${n} 답변` },
       kids,
     );
   }
@@ -1858,7 +2437,7 @@ function boot() {
       let tone = 'info';
       if (nt.kind === 'arrived') {
         tone = 'success';
-        lines.push(['🆘 ', issueLink(n), ' 에 Claude 답변이 도착했습니다']);
+        lines.push(['🆘 ', issueLink(n), ' 에 답변이 도착했습니다']);
         if (nt.state === 'error') lines.push('Claude 실행은 오류로 끝났지만 답변 내용은 볼 수 있습니다.');
         const entry = S.replies.get(n);
         const info = applyInfo(S.issues.get(n) || { number: n, body: '' }, entry && entry.reply);
@@ -1907,11 +2486,31 @@ function boot() {
   }
 
   function renderDone(today) {
-    const list = S.loaded ? completedList(today) : [];
-    els.doneCount.textContent = S.loaded ? `${list.length}건` : '';
+    if (!S.loaded) {
+      els.doneCount.textContent = '';
+      els.doneList.replaceChildren(el('p', { class: 'empty' }, '목록을 불러오면 표시됩니다.'));
+      return;
+    }
+    const all = completedList(today);
+    const list = all.filter((i) => !isHiddenDone(i));
+    const hiddenCount = all.length - list.length;
+    // 섹션 제목에는 '보이는 개수'(숨긴 것이 있으면 · 숨김 k). 상단 "이번 주 완료 n건"은 숨긴 것도 센다.
+    els.doneCount.textContent = `${list.length}건${hiddenCount ? ` · 숨김 ${hiddenCount}` : ''}`;
+    const note = el(
+      'p',
+      { class: 'extra-note' },
+      '다음 주(월요일 0시)가 되면 이 목록에서 저절로 빠집니다. [지우기]는 모든 기기의 이 목록에서 숨깁니다(GitHub 이슈와 기록은 남고, 이슈의 hidden 라벨을 떼면 다시 보입니다).',
+    );
     if (!list.length) {
       els.doneList.replaceChildren(
-        el('p', { class: 'empty' }, S.loaded ? '이번 주(월요일 0시 이후)에 완료한 일이 없습니다.' : '목록을 불러오면 표시됩니다.'),
+        el(
+          'p',
+          { class: 'empty' },
+          hiddenCount
+            ? `이번 주에 완료한 일을 모두 목록에서 지웠습니다(숨김 ${hiddenCount}건).`
+            : '이번 주(월요일 0시 이후)에 완료한 일이 없습니다.',
+        ),
+        hiddenCount ? note : null,
       );
       return;
     }
@@ -1919,16 +2518,31 @@ function boot() {
       el(
         'ol',
         { class: 'plain-list done-list' },
-        list.map((i) =>
-          el(
+        list.map((i) => {
+          const n = i.number;
+          const title = i.title || '(제목 없음)';
+          return el(
             'li',
             null,
             el('span', { class: 'when' }, i.closed_at ? shortDate(toKSTDate(i.closed_at)) : ''),
-            issueLink(i.number),
-            el('span', { class: 'title-text' }, i.title || '(제목 없음)'),
-          ),
-        ),
+            issueLink(n),
+            el('span', { class: 'title-text' }, title),
+            el(
+              'button',
+              {
+                type: 'button',
+                class: 'mini done-hide',
+                id: `btn-hide-${n}`,
+                disabled: S.busy.has(issueKey(n)),
+                'aria-label': `지우기: #${n} ${title} (완료 목록에서 숨김)`,
+                onclick: () => onHideDone(n),
+              },
+              '지우기',
+            ),
+          );
+        }),
       ),
+      note,
     );
   }
 
@@ -2078,7 +2692,9 @@ function boot() {
       if (left <= 0) {
         m.undo.expired = true;
         stopUndoTimer();
+        const hadFocus = document.activeElement === b;
         b.remove();
+        if (hadFocus) focusAfterUndoExpired(m);
         return;
       }
       b.textContent = `되돌리기 (${left}초)`;
@@ -2087,6 +2703,23 @@ function boot() {
     undoTimer = setInterval(tick, 250);
     b.addEventListener('click', () => onUndo(m, b));
     return b;
+  }
+
+  /**
+   * 포커스가 있던 [되돌리기]가 5초가 지나 사라질 때 키보드 포커스가 페이지 처음(body)으로 떨어지지 않게 옮긴다:
+   * [지우기]의 되돌리기면 지운 항목 자리의 이웃 항목 [지우기] → "이번 주 완료한 일" 제목, 그 밖에는 메시지의 다른 버튼 → 닫기(×).
+   */
+  function focusAfterUndoExpired(m) {
+    const u = m.undo || {};
+    const doneSummary = u.kind === 'hide' ? els.doneList.closest('details')?.querySelector('summary') : null;
+    const candidates = [
+      u.focusAfter ? byId(u.focusAfter) : null,
+      doneSummary,
+      els.message.querySelector('.msg-actions button'),
+      els.message.querySelector('.msg-close'),
+    ];
+    const t = candidates.find((x) => x && x.isConnected && !x.disabled);
+    if (t) t.focus({ preventScroll: true });
   }
 
   function renderMessage() {
@@ -2111,10 +2744,12 @@ function boot() {
     els.message.replaceChildren(card);
   }
 
+  function errorActions(e) {
+    return e instanceof ApiError && e.status === 401 ? [{ label: '⚙ 설정 열기', run: () => openSettings(true) }] : [];
+  }
+
   function showError(e) {
-    const actions = [];
-    if (e instanceof ApiError && e.status === 401) actions.push({ label: '⚙ 설정 열기', run: () => openSettings(true) });
-    showMessage({ tone: 'error', lines: [errorText(e)], actions });
+    showMessage({ tone: 'error', lines: [errorText(e)], actions: errorActions(e) });
   }
 
   // ── 동작 실행 래퍼(중복 클릭 방지) ─────────────────────
@@ -2374,15 +3009,17 @@ function boot() {
       }
       // 완료한 할 일의 🆘 자동 확인은 멈춘다(닫힌 이슈에 "답변 도착 · 본문에 반영"을 띄우지 않게)
       stopReplyWatch(n);
-      upsert(res.issue);
+      // hidden 을 뗀 경우: 라벨 응답에는 updated_at 이 없으므로 지연된 목록 응답에 밀리지 않게 로컬 시각을 올린다
+      upsert(res.hiddenRemoved ? touchLocal(res.issue) : res.issue);
       if (res.nextIssue) upsert(res.nextIssue);
       clearInputIf(sourceText);
       const lines = [['완료했습니다: ', issueLink(n), ' ', res.issue.title || '']];
       if (res.nextIssue) lines.push(['다음 단계 등록: ', issueLink(res.nextIssue.number), ' ', res.nextIssue.title || '']);
       if (res.nextError) lines.push(res.nextError);
+      if (res.hiddenError) lines.push(res.hiddenError);
       const actions = [];
       const msg = {
-        tone: res.nextError ? 'warn' : 'success',
+        tone: res.nextError || res.hiddenError ? 'warn' : 'success',
         lines,
         warnings,
         actions,
@@ -2395,6 +3032,7 @@ function boot() {
 
   async function onUndo(m, button) {
     if (!m.undo || m.undo.running || m.undo.expired) return;
+    if (m.undo.kind === 'hide') return onUndoHide(m, button);
     m.undo.running = true;
     stopUndoTimer();
     setMessageButtonsDisabled(true);
@@ -2410,6 +3048,80 @@ function boot() {
       if (u.replyIssue) lines.push(['등록했던 회신 확인 ', issueLink(u.replyIssue.number), ' 도 닫았습니다.']);
       showMessage({ tone: u.errors.length ? 'warn' : 'info', lines: [...lines, ...u.errors] });
     });
+  }
+
+  // ── 이번 주 완료한 일 [지우기] / 되돌리기 ───────────────
+  /** [지우기]: 확인창 없이 즉시 hidden 라벨(모든 기기의 완료 목록에서 숨김) + 5초 되돌리기. 이번 주 완료 개수는 그대로. */
+  function onHideDone(n) {
+    if (!requireApi()) return;
+    const focusAfter = neighborHideButtonId(n);
+    return runIssueAction(n, async () => {
+      const issue = S.issues.get(n);
+      if (!issue) throw new ApiError('할 일을 찾을 수 없습니다. 새로고침 후 다시 시도하세요.', 404);
+      let updated;
+      try {
+        updated = await hideDone(S.api, issue, { labelCache: S.labelCache });
+      } catch (e) {
+        // 다른 곳에서 다시 열린 할 일(409): 서버의 최신 상태로 목록을 정리한다(열린 할 일 목록으로 돌아감).
+        if (e instanceof ApiError && e.status === 409 && e.issue && Number.isInteger(e.issue.number)) upsert(e.issue);
+        throw e;
+      }
+      upsert(touchLocal(updated));
+      // 누른 [지우기]는 항목과 함께 사라지므로 키보드 포커스를 [되돌리기]로 옮긴다(focus: true).
+      showMessage({
+        tone: 'success',
+        lines: [[issueLink(n), ' 을(를) 완료 목록에서 지웠습니다']],
+        undo: { kind: 'hide', result: { issue: updated }, endsAt: Date.now() + UNDO_MS, focusAfter },
+        focus: true,
+      });
+    });
+  }
+
+  /** 완료 목록에서 #n 바로 다음(없으면 바로 앞) 항목의 [지우기] id — 되돌리기 시간이 지나면 포커스를 옮길 자리 */
+  function neighborHideButtonId(n) {
+    const li = byId(`btn-hide-${n}`)?.closest('li');
+    const sib = li ? li.nextElementSibling || li.previousElementSibling : null;
+    const b = sib ? sib.querySelector('button.done-hide') : null;
+    return b && b.id ? b.id : null;
+  }
+
+  async function onUndoHide(m, button) {
+    m.undo.running = true;
+    stopUndoTimer();
+    setMessageButtonsDisabled(true);
+    button.textContent = '되돌리는 중…';
+    const n = m.undo.result.issue.number;
+    let failure = null;
+    const done = await runIssueAction(n, async () => {
+      let u;
+      try {
+        u = await unhideDone(S.api, S.issues.get(n) || m.undo.result.issue);
+      } catch (e) {
+        failure = e;
+        return;
+      }
+      upsert(touchLocal(u));
+      showMessage({
+        tone: 'info',
+        lines: [['되돌렸습니다: ', issueLink(n), ' ', u.title || '', ' — 다시 완료 목록에 표시됩니다.']],
+      });
+    });
+    if (failure) {
+      // 되돌리기 실패(서버·권한·네트워크): 오류와 함께 [되돌리기]를 다시 5초 보여 준다 — 한 번의 일시 오류로 되돌릴 방법이 사라지지 않게.
+      showMessage({
+        tone: 'error',
+        lines: [['되돌리지 못했습니다: ', issueLink(n), ' 은(는) 아직 완료 목록에서 숨겨져 있습니다.'], errorText(failure)],
+        actions: errorActions(failure),
+        undo: { ...m.undo, running: false, expired: false, endsAt: Date.now() + UNDO_MS },
+        focus: true,
+      });
+    } else if (done) {
+      restoreFocus(`btn-hide-${n}`);
+    } else if (msgState === m) {
+      // 같은 항목을 처리 중이라 실행하지 못함 → 되돌리기를 다시 누를 수 있게 되살린다
+      m.undo.running = false;
+      renderMessage();
+    }
   }
 
   /** 회신 확인 등록. undo: 완료 메시지의 되돌리기 상태 — 아직 유효하면 새 메시지에도 같은 마감 시각으로 유지한다. */
@@ -2482,6 +3194,159 @@ function boot() {
         ],
       });
     });
+  }
+
+  // ── [✏ 변경] 열기·닫기·저장 ──────────────────────────
+  function prefersReducedMotion() {
+    try {
+      return window.matchMedia('(prefers-reduced-motion: reduce)').matches;
+    } catch {
+      return false;
+    }
+  }
+
+  /** 열린 편집 패널의 선택된 우선순위(없으면 첫 칸)로 포커스 */
+  function focusEditPanel(n, groupKey) {
+    const form = byId(`edit-${groupKey}-${n}`);
+    if (!form) return;
+    const t = form.querySelector('input[type=radio]:checked:not(:disabled)') || form.querySelector('input:not(:disabled), button:not(:disabled)');
+    if (t) t.focus({ preventScroll: true });
+  }
+
+  /** 그 행의 [✏ 변경] 으로 포커스(그룹이 바뀌었으면 data-fkey 로 찾는다). reveal: 화면 밖이면 보이게 스크롤. */
+  function focusEditButton(n, groupKey, reveal = false) {
+    const byGroup = groupKey ? byId(`btn-edit-${groupKey}-${n}`) : null;
+    const b =
+      byGroup && !byGroup.disabled
+        ? byGroup
+        : [...els.groups.querySelectorAll('button[data-fkey]')].find((x) => x.dataset.fkey === `btn-edit-${n}` && !x.disabled);
+    if (!b) return;
+    if (reveal) {
+      const r = b.getBoundingClientRect();
+      const stack = document.querySelector('.msg-stack');
+      const top = stack ? Math.max(0, stack.getBoundingClientRect().bottom) : 0;
+      if (r.top < top || r.bottom > window.innerHeight) b.scrollIntoView({ block: 'center', behavior: prefersReducedMotion() ? 'auto' : 'smooth' });
+    }
+    b.focus({ preventScroll: true });
+  }
+
+  /** 편집 패널의 날짜 칸에 키보드 포커스가 있으면 true (입력 중 — 배경 작업이 화면을 다시 그리지 않게 한다) */
+  function editingDueField() {
+    const a = document.activeElement;
+    return Boolean(a && a.matches && a.matches('form.edit-panel input[type="date"]') && els.app.contains(a));
+  }
+
+  /** [✏ 변경]/[✏ 닫기]: 행 아래 편집 패널을 열고 닫는다(다른 그룹에 그려진 같은 항목에서 누르면 패널을 그쪽으로 옮김). */
+  function onEditToggle(n, groupKey) {
+    const d = S.edits.get(n);
+    if (d && editAt.get(n) === groupKey) {
+      if (S.busy.has(issueKey(n))) return;
+      S.edits.delete(n);
+      render();
+      return;
+    }
+    if (d) {
+      d.group = groupKey;
+      render();
+      focusEditPanel(n, groupKey);
+      return;
+    }
+    if (!requireApi()) return;
+    const issue = S.issues.get(n);
+    if (!issue) return;
+    const due = parseBody(issue.body).due;
+    const p = priorityOf(issue);
+    // pCount: 열 때의 p 라벨 수. 1개가 아니면(GitHub에서 2개를 붙였거나 하나도 없음) 저장할 때 고른 우선순위를 그대로 보내
+    // updateTaskMeta 가 p 라벨을 하나로 정리하게 한다(같은 값을 골라도).
+    const pCount = labelNames(issue).filter((x) => PRIORITY_KEYS.includes(x)).length;
+    S.edits.set(n, { group: groupKey, origPriority: p, origDue: due, pCount, priority: p, due: due || '', noDue: !due, lastDue: '' });
+    render();
+    focusEditPanel(n, groupKey);
+  }
+
+  /** [취소]·Esc: 요청 없이 패널을 닫고 그 행의 [✏ 변경] 으로 포커스 */
+  function onEditCancel(n) {
+    if (S.busy.has(issueKey(n))) return;
+    const g = editAt.get(n) || (S.edits.get(n) && S.edits.get(n).group) || null;
+    S.edits.delete(n);
+    render();
+    focusEditButton(n, g);
+  }
+
+  /**
+   * [저장]: 패널을 연 뒤 바꾼 값만 보낸다(손대지 않은 칸은 그대로 — 다른 곳의 변경을 덮지 않게).
+   * 단 열 때 p 라벨이 1개가 아니었으면 우선순위는 늘 보낸다(라벨 정리 — updateTaskMeta 의 'p 라벨 2개 이상·없음' 규칙).
+   * 바꾼 게 없으면 요청 없이 '바뀐 내용이 없습니다'. 성공하면 패널을 닫고 응답 이슈로 그 행을 즉시 옮긴다
+   * (목록 다시 받기 없음, upsert → 60초 캐시 동안 로컬 상태 우선). 포커스는 옮겨 간 행의 [✏ 변경].
+   */
+  async function onEditSave(n) {
+    if (!requireApi()) return;
+    const d = S.edits.get(n);
+    if (!d || S.busy.has(issueKey(n))) return;
+    const groupNow = editAt.get(n) || d.group;
+    const focusField = (what) => {
+      const t = byId(`edit-${what}-${groupNow}-${n}`);
+      if (t && !t.disabled) t.focus({ preventScroll: true });
+    };
+    if (!d.noDue && !d.due) {
+      showMessage({ tone: 'warn', lines: [[issueLink(n), ` ${META_TEXT.needDate}`]] });
+      focusField('due');
+      return;
+    }
+    // 형식 + 범위(날짜 칸 min·max): 폼이 novalidate 라 브라우저가 막지 않는다 — 연도를 덜 친 0202-10-30 등
+    if (!d.noDue && !isDueInRange(d.due)) {
+      showMessage({ tone: 'warn', lines: [[issueLink(n), ` ${META_TEXT.badDate}`]] });
+      focusField('due');
+      return;
+    }
+    const want = d.noDue ? null : d.due;
+    const change = {};
+    if (d.priority !== d.origPriority || d.pCount !== 1) change.priority = d.priority;
+    if (want !== d.origDue) change.due = want;
+    if (!Object.keys(change).length) {
+      showMessage({ tone: 'info', lines: [[issueLink(n), ` ${META_TEXT.noChange}`]] });
+      return;
+    }
+    let target = null;
+    await runIssueAction(n, async () => {
+      let res;
+      try {
+        res = await updateTaskMeta(S.api, S.issues.get(n) || { number: n }, change, { labelCache: S.labelCache });
+      } catch (e) {
+        // 이미 완료(409)·할 일이 아님(400): 서버의 최신 이슈로 목록을 정리하고 패널을 닫는다.
+        if (e instanceof ApiError && (e.status === 409 || e.status === 400) && e.issue && Number.isInteger(e.issue.number)) {
+          upsert(e.issue);
+          S.edits.delete(n);
+          if (e.status === 409) stopReplyWatch(n);
+          showMessage({
+            tone: 'error',
+            lines: [[issueLink(n), ` ${e.message}`], META_TEXT.listUpdated],
+            actions: [{ label: '목록 새로고침', run: () => loadAll() }],
+            focus: true,
+          });
+          return;
+        }
+        throw e; // 그 밖의 오류(401 → ⚙ 설정 열기 등): 패널과 입력값은 그대로 두어 다시 저장할 수 있다
+      }
+      const fresh = res.issue && res.issue.updated_at ? res.issue : touchLocal(res.issue);
+      upsert(fresh);
+      S.edits.delete(n);
+      const today = todayKST();
+      const cur = S.issues.get(n) || fresh;
+      // 옮겨 갈 그룹(접혀 있으면 펼친다 — 옮긴 행과 [✏ 변경] 포커스가 보이게). 같은 그룹에 남으면 그 그룹.
+      const groups = isTask(cur) && cur.state !== 'closed' ? groupsOf(cur, today) : [];
+      target = groups.includes(groupNow) ? groupNow : groups[0] || null;
+      if (target && S.groupOpen.get(target) === false) S.groupOpen.set(target, true);
+      if (!res.changed.length) {
+        showMessage({ tone: 'info', lines: [[issueLink(n), ` ${META_TEXT.noChange}`], META_TEXT.alreadySame] });
+        return;
+      }
+      showMessage({
+        tone: 'success',
+        lines: [[issueLink(n), ` ${metaChangeText(cur, res.changed, today)}`], ...metaChangeNotes(cur, res.changed, today)],
+      });
+    });
+    if (target && !S.edits.has(n)) focusEditButton(n, target, true);
   }
 
   function onSubtaskToggle(n, item, checked) {
@@ -2662,17 +3527,33 @@ function boot() {
     const tick = async () => {
       w.timer = null;
       if (!alive()) return;
+      // 날짜 칸에 입력 중이면 확인을 미룬다(세지 않음): 그 칸을 벗어나면 곧 확인하고 알린다
+      if (editingDueField()) {
+        w.timer = setTimeout(tick, EDIT_DEFER_MS);
+        return;
+      }
       w.checks += 1;
       let reply = null;
       let changed = false;
       try {
         const comments = await w.api.listComments(n);
         if (!alive()) return;
+        if (editingDueField()) {
+          // 응답을 기다리는 사이 날짜 칸에 들어갔으면 이번 결과는 버리고 다시 미룬다(다시 그리기 없음)
+          w.checks -= 1;
+          w.timer = setTimeout(tick, EDIT_DEFER_MS);
+          return;
+        }
         S.replies.set(n, replyEntry(comments, ++S.replySeq));
         changed = setCommentCount(n, comments.length);
         reply = findClaudeReply(comments, { since: w.since });
       } catch (e) {
         if (!alive()) return;
+        if (editingDueField()) {
+          w.checks -= 1;
+          w.timer = setTimeout(tick, EDIT_DEFER_MS);
+          return;
+        }
         if (e instanceof ApiError && [401, 404, 410].includes(e.status)) {
           finish({ kind: 'error', n, message: errorText(e) });
           return;
@@ -2818,6 +3699,7 @@ function boot() {
     S.replies = new Map();
     S.replyOpen = new Set();
     S.notices = new Map();
+    S.edits = new Map();
     clearMessage();
     applyTokenPresence();
     render();
@@ -2911,7 +3793,8 @@ function boot() {
     testConnectionUI();
   });
   const checkDayChange = () => {
-    if (todayKST() !== S.today) render();
+    // 날짜 칸에 입력 중이면 다음 확인(1분 뒤·화면 복귀)으로 미룬다(EDIT_DEFER_MS 설명 참고)
+    if (todayKST() !== S.today && !editingDueField()) render();
   };
   setInterval(checkDayChange, 60000);
   document.addEventListener('visibilitychange', () => {
