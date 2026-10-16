@@ -977,51 +977,379 @@ export function setDueInBody(body, due) {
   if (!(due === null || (typeof due === 'string' && isValidYMD(due)))) {
     throw new TypeError(`마감은 'YYYY-MM-DD'(실존 날짜) 또는 null 이어야 합니다: ${String(due)}`);
   }
+  return writeKeyLine(body, 'due', due === null ? null : `Due: ${due}`, false);
+}
+
+/**
+ * [줄, 구분자, 줄, …, 줄] 을 잇는다. guardCr: 단독 \r 뒤에 빈 줄과 \n 이 새로 이어지면 다시 읽을 때 '\r\n' 하나가 되어
+ * 빈 줄이 사라지므로 그 \r 을 \r\n 으로 쓴다(\r 과 \n 이 섞인 드문 본문에서 줄 구조 보존 — 6차 함수만 쓴다).
+ */
+function joinParts(parts, guardCr) {
+  if (!guardCr) return parts.join('');
+  let s = '';
+  for (let i = 0; i < parts.length; i += 1) {
+    s += i % 2 === 1 && parts[i] === '\r' && parts[i + 1] === '' && parts[i + 2] === '\n' ? '\r\n' : parts[i];
+  }
+  return s;
+}
+
+// 본문 형식 순서(CLAUDE.md '본문 형식'): 반복 → Due → 완료 기준 → 제출 → 예상 → 다음 → 메모
+const BODY_KEY_ORDER = ['recurrence', 'due', 'criteria', 'submitTo', 'estimate', 'next', 'memo'];
+
+/**
+ * 키 줄 하나를 바꾸거나 넣거나 지운다(setDueInBody·setBodyField 공용 내부 함수). line: 새 줄 전체 또는 null(지우기).
+ * guardCr: joinParts 참고(setDueInBody 는 5차 동작 그대로 false, setBodyField 는 true).
+ * 줄 판정은 parseBody 와 같다(CHECK_RE 를 먼저 보고, 체크리스트가 아닌 줄만 BODY_KEY_RE — 대소문자·전각 콜론 포함).
+ * - 바꾸기: parseBody 가 그 키로 읽는 바로 그 줄(첫 키 줄)만 line 으로. 뒤의 같은 키 줄(parseBody 가 무시)은 그대로.
+ * - 넣기(그 키 줄이 없을 때): 본문 형식 순서상 앞 키들의 줄(parseBody 가 읽는 첫 줄들) 중 본문에서 가장 뒤에 있는 줄 바로 뒤
+ *   → 없으면 뒤 키들의 줄 중 본문에서 가장 앞에 있는 줄 바로 앞 → 키 줄이 하나도 없으면 맨 앞
+ *   (본문이 비었으면 line 만, 첫 줄이 `#` 제목이면 사이에 빈 줄 하나). 넣는 줄바꿈은 본문의 첫 줄바꿈 형식(없으면 \n).
+ *   (Due 는 앞 키가 반복뿐이라 '반복 줄 바로 뒤 → 첫 키 줄 바로 앞 → 맨 앞' — 5차 setDueInBody 규칙과 같다.)
+ * - 지우기(null): emptyLine 이 없으면(setDueInBody — 5차 동작) 그 키 줄을 모두 줄바꿈째 지운다(빈 줄을 남기지 않음,
+ *   마지막 줄이면 앞 줄바꿈을 지움 — 뒤 줄이 새로 읽히지 않게). 없으면 본문 그대로.
+ *   emptyLine 이 있으면(setBodyField 의 메모 지우기) parseBody 가 읽는 첫 키 줄 하나만 다룬다: 뒤에 같은 키 줄이 없으면 그 줄을
+ *   줄바꿈째 지우고, 뒤에 같은 키 줄이 또 있으면(손으로 적은 다른 구획의 `메모:` 문단·코드 블록 속 줄·두 번째 줄의 회차 표지 등)
+ *   첫 줄을 빈 값 줄 emptyLine(`메모:`)으로 바꾼다 — parseBody 는 빈 값을 null 로 읽고 그 키를 읽은 것으로 치므로 뒤 줄이
+ *   새로 읽히지 않고, 뒤 줄(사람이 쓴 글)은 한 글자도 지우지 않는다.
+ * - 그 밖의 줄과 줄바꿈(\r\n / \n / \r)은 한 글자도 바꾸지 않는다(guardCr 의 \r → \r\n 예외만). body 가 null·undefined 면 빈 본문으로 본다.
+ */
+function writeKeyLine(body, key, line, guardCr, emptyLine = null) {
   const text = body === null || body === undefined ? '' : String(body);
   // 줄과 줄바꿈 문자를 분리해 보존: [줄, 구분자, 줄, 구분자, ..., 줄] (toggleChecklist 와 같은 방식)
   const parts = text.split(/(\r\n|\n|\r)/);
-  const dueAt = [];
-  let recurAt = -1;
-  let firstKeyAt = -1;
+  const at = new Map(); // 키 → 그 키 줄들의 parts 인덱스(본문 순서)
   for (let i = 0; i < parts.length; i += 2) {
     if (CHECK_RE.test(parts[i])) continue;
     const m = BODY_KEY_RE.exec(parts[i]);
     if (!m) continue;
-    const key = keyName(m[1]);
-    if (!key) continue;
-    if (firstKeyAt < 0) firstKeyAt = i;
-    if (key === 'due') dueAt.push(i);
-    else if (key === 'recurrence' && recurAt < 0) recurAt = i;
+    const k = keyName(m[1]);
+    if (!k) continue;
+    if (!at.has(k)) at.set(k, []);
+    at.get(k).push(i);
   }
+  const mine = at.get(key) || [];
 
-  if (due === null) {
-    if (!dueAt.length) return text;
+  if (line === null) {
+    if (!mine.length) return text;
+    if (emptyLine !== null && mine.length > 1) {
+      parts[mine[0]] = emptyLine; // 첫 줄만 빈 값으로 — 뒤의 같은 키 줄은 그대로(지우지 않음)
+      return joinParts(parts, guardCr);
+    }
     // 뒤에서부터 지운다(앞쪽 인덱스가 바뀌지 않게)
-    for (let k = dueAt.length - 1; k >= 0; k -= 1) {
-      const i = dueAt[k];
+    for (let n = mine.length - 1; n >= 0; n -= 1) {
+      const i = mine[n];
       if (i + 1 < parts.length) parts.splice(i, 2); // 줄 + 뒤 줄바꿈
       else if (i > 0) parts.splice(i - 1, 2); // 마지막 줄: 앞 줄바꿈 + 줄
       else parts.splice(0, 1, ''); // 유일한 줄
     }
-    return parts.join('');
+    return joinParts(parts, guardCr);
   }
 
-  const line = `Due: ${due}`;
-  if (dueAt.length) {
-    parts[dueAt[0]] = line;
-    return parts.join('');
+  if (mine.length) {
+    parts[mine[0]] = line;
+    return joinParts(parts, guardCr);
+  }
+  const order = BODY_KEY_ORDER.indexOf(key);
+  let after = -1;
+  let before = -1;
+  for (const [k, list] of at) {
+    const o = BODY_KEY_ORDER.indexOf(k);
+    const first = list[0];
+    if (o < order) after = Math.max(after, first);
+    else if (o > order && (before < 0 || first < before)) before = first;
   }
   const nl = parts.length > 1 ? parts[1] : '\n';
-  if (recurAt >= 0) {
-    parts.splice(recurAt + 1, 0, nl, line);
-    return parts.join('');
+  if (after >= 0) {
+    parts.splice(after + 1, 0, nl, line);
+    return joinParts(parts, guardCr);
   }
-  if (firstKeyAt >= 0) {
-    parts.splice(firstKeyAt, 0, line, nl);
-    return parts.join('');
+  if (before >= 0) {
+    parts.splice(before, 0, line, nl);
+    return joinParts(parts, guardCr);
   }
   if (text === '') return line;
   return HEADING_LINE_RE.test(parts[0]) ? `${line}${nl}${nl}${text}` : `${line}${nl}${text}`;
+}
+
+// ---------------------------------------------------------------------------
+// 세부 내용 편집(6차: [✏ 변경] 패널의 완료 기준·메모·하위 작업)
+
+export const BODY_FIELD_MAX_CHARS = 500; // 완료 기준·메모(회차면 표지를 뺀 사용자 메모) 최대 글자 수
+export const SUBTASK_MAX_CHARS = 200; // 하위 작업 한 줄 최대 글자 수
+const CRITERIA_UNSET = '(미정)';
+const BODY_FIELD_LABEL = Object.freeze({ criteria: '완료 기준', memo: '메모' });
+
+/**
+ * 글자 수(코드 포인트). 이미 sanitizeText 를 거친 '@ claude' 는 입력한 그대로('@claude')로 센다
+ * — 본문에서 읽은 값을 그대로 다시 저장해도 한도를 새로 넘지 않게(입력칸 maxlength 와 같은 기준).
+ */
+function inputLen(s) {
+  return charLen(String(s).replace(/@ claude/gi, '@claude'));
+}
+
+/**
+ * 회차 표지 `반복원본: #N / 회차: YYYY-MM-DD`. scripts/daily.mjs 의 MARKER_RE(중복 방지 — 본문 어디서나 찾음)와
+ * 같은 형식(공백 허용 정도 포함)이다. docs/ 는 scripts/ 를 import 하지 않으므로 여기 따로 두고, 두 정규식의 source 가 같은지
+ * tests/details.test.mjs 가 확인한다. (전역 플래그 없음 — exec 가 상태를 남기지 않는다.)
+ */
+export const INSTANCE_MARKER_RE = /반복원본:\s*#(\d+)\s*\/\s*회차:\s*(\d{4}-\d{2}-\d{2})/;
+const MARKER_ONLY_RE = new RegExp(`^${INSTANCE_MARKER_RE.source}$`);
+const MEMO_MARKER_SEP = ' · ';
+// 표지와 사용자 메모 사이 구분자로 보는 글자(하나만 뗀다 — 사용자 메모가 같은 글자로 시작해도 그대로 남게)
+const MEMO_SEP_CHARS = new Set([...'·・•/|,;']);
+
+/** 앞(또는 뒤)의 공백 → 구분자 글자 하나 → 공백을 뗀다(정규식 대신 루프 — 긴 공백에서 역추적 없음) */
+function stripMemoSep(s, fromEnd) {
+  const ws = (ch) => isSpaceChar(ch);
+  if (fromEnd) {
+    let t = trimEndWhile(s, ws);
+    if (t && MEMO_SEP_CHARS.has(t[t.length - 1])) t = trimEndWhile(t.slice(0, -1), ws);
+    return t.trim();
+  }
+  let t = trimStartWhile(s, ws);
+  if (t && MEMO_SEP_CHARS.has(t[0])) t = trimStartWhile(t.slice(1), ws);
+  return t.trim();
+}
+
+/**
+ * 메모 값 → { marker, text }. marker: 회차 표지 원문(본문에 쓰인 글자 그대로) 또는 null, text: 사용자 메모(trim) 또는 null.
+ * - 표지는 INSTANCE_MARKER_RE 로 찾는다(daily.mjs 와 같은 형식). 보통은 메모 맨 앞(`반복원본: #3 / 회차: 2026-10-15 · 자료 위치`)이고,
+ *   표지 바로 뒤의 구분자 하나(` · `, `/`, `,` 등)와 공백은 떼고 나머지를 사용자 메모로 본다.
+ * - 손으로 고친 본문에서 표지가 메모 가운데에 있으면, 표지 앞뒤 글을 ` · ` 로 이어 사용자 메모로 본다
+ *   (표지는 그대로 보호한다 — joinMemoMarker 로 다시 쓰면 표지가 맨 앞으로 온다).
+ * - 표지가 없으면 marker null, text = 메모 전체. memo 가 null·undefined 면 둘 다 null.
+ * 성질: splitMemoMarker(joinMemoMarker(m, t)) → { marker: m, text: t 를 한 줄로 정리한 값(빈 값이면 null) }
+ *   (m 이 null 인데 t 자체에 표지 글자가 있으면 그 표지를 찾는다).
+ */
+export function splitMemoMarker(memo) {
+  if (memo === null || memo === undefined) return { marker: null, text: null };
+  const s = String(memo);
+  const m = INSTANCE_MARKER_RE.exec(s);
+  if (!m) return { marker: null, text: s.trim() || null };
+  const before = stripMemoSep(s.slice(0, m.index), true);
+  const after = stripMemoSep(s.slice(m.index + m[0].length), false);
+  const text = [before, after].filter(Boolean).join(MEMO_MARKER_SEP);
+  return { marker: m[0], text: text || null };
+}
+
+/**
+ * 회차 표지 + 사용자 메모 → 메모 값. 표지가 있으면 `표지 · 사용자 메모`(사용자 메모가 비면 표지만), 없으면 사용자 메모(비면 null).
+ * 사용자 메모는 한 줄로 정리한다(줄바꿈·연속 공백 → 공백 하나, trim). @claude 정리·글자 수 검사는 setBodyField 가 한다.
+ * marker 는 splitMemoMarker 가 돌려준 표지(전체가 표지 형식)여야 한다 — 아니면 TypeError(표지가 망가진 채 저장되지 않게).
+ */
+export function joinMemoMarker(marker, text) {
+  const t = text === null || text === undefined ? '' : collapse(text);
+  if (marker === null || marker === undefined || marker === '') return t || null;
+  const mk = String(marker).trim();
+  if (!MARKER_ONLY_RE.test(mk)) throw new TypeError(`회차 표지 형식이 아닙니다: ${mk}`);
+  return t ? `${mk}${MEMO_MARKER_SEP}${t}` : mk;
+}
+
+/**
+ * 회차 표지 글자(INSTANCE_MARKER_RE)를 모두 뗀 글. 표지 앞뒤 글은 splitMemoMarker 와 같이 ' · ' 로 잇고, 남는 글이 없으면 ''.
+ * 완료 기준과 새로 적거나 고친 하위 작업 줄에 쓴다 — 아침 작업(scripts/daily.mjs)은 본문 어디서나 표지를 찾으므로, 메모 밖의 칸에 적힌
+ * 표지 글자 때문에 그 날의 회차가 '이미 있음'으로 건너뛰어지지 않게 한다. (메모는 호출부가 최신 표지를 joinMemoMarker 로 붙인다.)
+ * 한 번 돌 때마다 표지가 하나씩 줄어드므로(잇는 ' · ' 는 표지 글자가 아님) 반드시 끝난다.
+ */
+export function stripInstanceMarkers(s) {
+  let t = s === null || s === undefined ? '' : String(s);
+  while (INSTANCE_MARKER_RE.test(t)) t = splitMemoMarker(t).text || '';
+  return t.trim();
+}
+
+/**
+ * setBodyField 가 저장할 값(정규화). key: 'criteria'(완료 기준) | 'memo'(메모), value: string | null.
+ * - 한 줄로(줄바꿈·연속 공백 → 공백 하나, trim) → sanitizeText(@claude → @ claude).
+ * - 완료 기준에 적힌 회차 표지 글자(`반복원본: #N / 회차: YYYY-MM-DD`)는 뗀다(stripInstanceMarkers — 표지는 메모에만 둔다).
+ * - 완료 기준은 비거나 null 이면 '(미정)'(본문 형식: 완료 기준 줄은 항상 있음). 메모는 비거나 null 이면 null(줄 삭제).
+ * - 최대 BODY_FIELD_MAX_CHARS(500)자 — 넘으면 잘라내지 않고 TypeError(입력칸 maxlength 가 미리 막는다).
+ *   메모는 회차 표지를 뺀 사용자 메모 부분만 센다. 글자 수는 sanitizeText 전 기준(inputLen).
+ * - key 가 둘 중 하나가 아니거나 value 가 string·null 이 아니면 TypeError.
+ * 결과는 parseBody(setBodyField(b, key, value))[key] 와 같다 — 충돌·변경 비교에 쓴다.
+ */
+export function normalizeBodyField(key, value) {
+  if (!Object.prototype.hasOwnProperty.call(BODY_FIELD_LABEL, key)) {
+    throw new TypeError(`바꿀 수 있는 본문 칸은 criteria(완료 기준)·memo(메모)입니다: ${String(key)}`);
+  }
+  if (value !== null && typeof value !== 'string') {
+    throw new TypeError(`${BODY_FIELD_LABEL[key]} 값은 문자열 또는 null 이어야 합니다`);
+  }
+  const v0 = value === null ? '' : collapse(value);
+  const v = key === 'criteria' ? stripInstanceMarkers(v0) : v0;
+  const counted = key === 'memo' ? splitMemoMarker(v).text ?? '' : v;
+  if (inputLen(counted) > BODY_FIELD_MAX_CHARS) {
+    throw new TypeError(`${BODY_FIELD_LABEL[key]}은(는) ${BODY_FIELD_MAX_CHARS}자까지 적을 수 있습니다`);
+  }
+  if (v === '') return key === 'criteria' ? CRITERIA_UNSET : null;
+  return sanitizeText(v);
+}
+
+/**
+ * 본문의 완료 기준·메모 줄만 바꾼다(홈페이지 [✏ 변경] 패널). key: 'criteria' | 'memo', value: string | null.
+ * 값은 normalizeBodyField 로 정리한다(한 줄·sanitizeText·500자 — 넘으면 TypeError, 완료 기준을 비우면 '(미정)', 메모를 비우면 줄 삭제).
+ * 줄 다루기는 setDueInBody 와 같다(writeKeyLine):
+ * - 바꾸기: parseBody 가 읽는 바로 그 줄(첫 키 줄, 체크리스트 줄 제외)을 `완료 기준: 값` / `메모: 값` 으로.
+ * - 넣기: 본문 형식 순서(반복 → Due → 완료 기준 → 제출 → 예상 → 다음 → 메모)에 맞는 자리 — 앞 키 줄들 중 마지막 바로 뒤,
+ *   없으면 뒤 키 줄들 중 첫 줄 바로 앞, 키 줄이 없으면 맨 앞(첫 줄이 `#` 제목이면 빈 줄 하나).
+ * - 지우기(메모 null): parseBody 가 읽는 첫 `메모:` 줄을 줄바꿈째 지운다(빈 줄을 남기지 않음). 뒤에 다른 `메모:` 줄이 또 있으면
+ *   (손으로 적은 다른 구획의 문단·코드 블록 속 줄 등) 그 줄들은 지우지 않고, 첫 줄을 빈 값 `메모:` 로 바꿔 뒤 줄이 새로 읽히지 않게 한다.
+ * - 회차 표지 보호는 호출부가 한다: 메모 값 = joinMemoMarker(최신 표지, 사용자 메모)(사용자 메모를 비워도 표지는 남는다).
+ * - 그 밖의 줄과 줄바꿈 형식은 한 글자도 바꾸지 않는다(\r 과 \n 이 섞인 본문에서 빈 줄이 사라지지 않게 \r 하나를 \r\n 으로 쓰는 경우만 예외 — joinParts).
+ * 성질: parseBody(결과)[key] === normalizeBodyField(key, value) 이고 나머지 parseBody 필드는 그대로다.
+ */
+export function setBodyField(body, key, value) {
+  const v = normalizeBodyField(key, value);
+  const label = BODY_FIELD_LABEL[key];
+  return writeKeyLine(body, key, v === null ? null : `${label}: ${v}`, true, `${label}:`);
+}
+
+// 하위 작업 텍스트 앞에 붙은 목록·체크박스 표기(`- [ ] `, `- [x] `, `* [ ] `, `- `, `* `) — 뒤가 공백이거나 끝일 때만
+// ('-5kg 감량', '*중요* 자료' 같은 텍스트는 그대로).
+const SUBTASK_PREFIX_RE = /^[-*]\s+\[[ xX]\](?:\s+|$)|^[-*](?:\s+|$)/;
+const SUBTASK_HEADING = '## 하위 작업'; // docs/app.js mergeSubtasksIntoBody 와 같은 구획 판정(줄이 이 글자로 시작)
+const SECTION_END_RE = /^#{1,6}\s/; // 다음 제목에서 구획 끝(mergeSubtasksIntoBody 와 같다)
+const isBlankLine = (s) => s.trim() === '';
+
+/** 하위 작업 글자 비교 키(한 줄·sanitizeText) — 본문에 이미 있는 줄인지(normalizeSubtasks 의 keep) 볼 때 쓴다 */
+const subtaskKey = (t) => sanitizeText(collapse(t));
+
+/**
+ * 하위 작업 목록 정규화(setSubtasks 가 저장할 그대로). items: [{ text, done }] 또는 문자열 배열(done=false). 배열이 아니면 TypeError.
+ * - text: 한 줄로(줄바꿈·연속 공백 → 공백 하나, trim) → 회차 표지 글자를 뗌(stripInstanceMarkers) → 앞에 붙은 `- [ ]`·`- [x]`·`-`·`*`
+ *   표기를 뗌(겹쳐 있으면 모두) → 빈 항목은 뺀다 → sanitizeText. 최대 SUBTASK_MAX_CHARS(200)자 — 넘으면 TypeError(`N번째 하위 작업은 …`).
+ *   체크 상태는 done 으로만 정한다(텍스트의 `[x]` 표기는 떼기만 한다). 같은 문구가 여럿이어도 그대로 둔다.
+ * - opts.keep: 본문에 이미 있던 하위 작업(글자 배열 또는 [{ text }]). 한 줄로 정리한 글자(@claude 정리 기준)가 그중 하나와 같은 항목은
+ *   손대지 않은 기존 줄로 보고 표기·표지 떼기와 200자 검사를 하지 않는다(한 줄 정리·sanitizeText 만) — 다른 줄을 고쳐 저장해도
+ *   GitHub 에서 적어 둔 `- 3단계`·`-` 같은 항목이 바뀌거나 사라지지 않고, 200자가 넘는 긴 줄(URL 등)도 그대로 저장된다.
+ *   keep 이 배열이 아니면(null·undefined 제외) TypeError.
+ * → [{ text, done }] (순서 그대로). parseBody(setSubtasks(b, items, { keep })).subtasks 와 같다
+ *   (setSubtasks 는 b 의 하위 작업을 keep 에 더한다) — 충돌·변경 비교에 쓴다. 같은 keep 으로 두 번 해도 같다.
+ */
+export function normalizeSubtasks(items, opts = {}) {
+  if (!Array.isArray(items)) throw new TypeError('하위 작업은 배열이어야 합니다');
+  const keepSrc = opts && typeof opts === 'object' ? opts.keep : undefined;
+  if (keepSrc !== undefined && keepSrc !== null && !Array.isArray(keepSrc)) throw new TypeError('keep 은 배열이어야 합니다');
+  const keep = new Set();
+  for (const k of keepSrc || []) {
+    const t = k !== null && typeof k === 'object' ? k.text : k;
+    if (typeof t === 'string' && t.trim()) keep.add(subtaskKey(t));
+  }
+  const out = [];
+  items.forEach((it, i) => {
+    let raw;
+    if (typeof it === 'string') raw = it;
+    else if (it === null || it === undefined) raw = '';
+    else if (typeof it === 'object') raw = it.text === null || it.text === undefined ? '' : String(it.text);
+    else throw new TypeError(`${i + 1}번째 하위 작업 형식이 잘못됐습니다`);
+    const done = typeof it === 'object' && it !== null && Boolean(it.done);
+    let t = collapse(raw);
+    if (t && keep.has(sanitizeText(t))) {
+      out.push({ text: sanitizeText(t), done }); // 본문에 이미 있던 줄: 그대로
+      return;
+    }
+    t = stripInstanceMarkers(t);
+    for (let m = SUBTASK_PREFIX_RE.exec(t); m; m = SUBTASK_PREFIX_RE.exec(t)) t = t.slice(m[0].length);
+    if (inputLen(t) > SUBTASK_MAX_CHARS) {
+      throw new TypeError(`${i + 1}번째 하위 작업은 ${SUBTASK_MAX_CHARS}자까지 적을 수 있습니다`);
+    }
+    if (!t) return;
+    out.push({ text: sanitizeText(t), done });
+  });
+  return out;
+}
+
+/**
+ * 본문의 하위 작업 전체를 items 로 바꾼다(홈페이지 [✏ 변경] 패널 — 추가·수정·삭제·순서·체크). items 는 normalizeSubtasks 로 정리한다
+ * (keep = 이 본문의 하위 작업 + opts.keep — 본문에 이미 있던 글자 그대로의 항목은 표기 떼기·200자 검사 없이 그대로 쓴다).
+ * - 본문의 모든 체크리스트 줄(CHECK_RE — parseBody 가 하위 작업으로 읽는 줄 전부, 코드 블록 안 포함)을 지우고,
+ *   `## 하위 작업` 구획(줄이 이 글자로 시작하는 첫 줄 ~ 다음 `#` 제목 전)에 `- [ ] 텍스트` / `- [x] 텍스트` 를 순서대로 쓴다.
+ *   쓰는 자리는 구획의 첫 체크리스트 줄 자리(없으면 제목 바로 아래). 구획 안 체크리스트 줄 사이의 빈 줄도 함께 지운다.
+ *   구획 밖에 있던 체크리스트 줄도 이 구획으로 모인다(손으로 고친 본문 등 드문 경우).
+ * - 구획이 없으면 본문 끝에 빈 줄 하나 뒤 `## 하위 작업` 을 새로 만든다(buildBody·mergeSubtasksIntoBody 와 같은 모양).
+ * - items 가 비면 체크리스트 줄을 지우고, 구획에 다른 글이 없으면 `## 하위 작업` 제목 줄과 그 구획의 빈 줄도 지운다
+ *   (구획에 다른 문단이 있으면 제목은 남긴다). 지운 자리 때문에 본문 끝에 남는 빈 줄은 정리한다.
+ * - 그 밖의 줄(키 줄, 다른 제목·문단)은 그대로. 줄바꿈은 각 줄 그대로, 새로 쓰는 줄은 본문의 첫 줄바꿈 형식(없으면 \n)
+ *   (\r 과 \n 이 섞인 본문의 빈 줄 보존 예외는 joinParts).
+ * - 들여쓴(중첩) 체크리스트 줄도 모두 한 단계(`- [ ] …`)로 모이고, 코드 블록(```) 안의 체크리스트 줄도 하위 작업으로 읽으므로 옮겨진다
+ *   (parseBody 와 같은 판정 — 설명서 6-8·README·CLAUDE.md 에 적어 둠).
+ * 성질: parseBody(결과).subtasks 가 normalizeSubtasks(items, { keep: [본문의 하위 작업, ...opts.keep] }) 와 같고({ done, text })
+ * 나머지 parseBody 필드는 그대로다. 본문에 이미 있는 줄이 없으면 normalizeSubtasks(items) 와 같다.
+ * mergeSubtasksIntoBody(🆘 반영)·toggleChecklist(체크)·buildBody 가 만드는 형식과 서로 호환된다. body 가 null·undefined 면 빈 본문.
+ */
+export function setSubtasks(body, items, opts = {}) {
+  const text = body === null || body === undefined ? '' : String(body);
+  const extra = opts && typeof opts === 'object' ? opts.keep : undefined;
+  if (extra !== undefined && extra !== null && !Array.isArray(extra)) throw new TypeError('keep 은 배열이어야 합니다');
+  const list = normalizeSubtasks(items, { keep: [...parseBody(text).subtasks, ...(extra || [])] });
+  const parts = text.split(/(\r\n|\n|\r)/);
+  const nl = parts.length > 1 ? parts[1] : '\n';
+  const lines = [];
+  for (let i = 0; i < parts.length; i += 2) lines.push({ text: parts[i], sep: parts[i + 1] ?? '', orig: i / 2 });
+  const isCheck = lines.map((l) => CHECK_RE.test(l.text));
+  const drop = new Set();
+  isCheck.forEach((c, i) => {
+    if (c) drop.add(i);
+  });
+
+  const head = lines.findIndex((l) => l.text.startsWith(SUBTASK_HEADING));
+  let insertAt = -1;
+  if (head >= 0) {
+    let end = lines.length;
+    for (let j = head + 1; j < lines.length; j += 1) {
+      if (SECTION_END_RE.test(lines[j].text)) {
+        end = j;
+        break;
+      }
+    }
+    let firstCheck = -1;
+    let lastCheck = -1;
+    let other = false; // 구획에 체크리스트·빈 줄 말고 다른 글이 있음
+    for (let j = head + 1; j < end; j += 1) {
+      if (isCheck[j]) {
+        if (firstCheck < 0) firstCheck = j;
+        lastCheck = j;
+      } else if (!isBlankLine(lines[j].text)) other = true;
+    }
+    for (let j = firstCheck + 1; firstCheck >= 0 && j < lastCheck; j += 1) {
+      if (isBlankLine(lines[j].text)) drop.add(j); // 체크리스트 줄 사이 빈 줄
+    }
+    if (list.length) insertAt = firstCheck >= 0 ? firstCheck : head + 1;
+    else if (!other) for (let j = head; j < end; j += 1) drop.add(j); // 빈 구획: 제목째
+  }
+
+  const fresh = list.map((it) => ({ text: `- [${it.done ? 'x' : ' '}] ${it.text}`, sep: nl, orig: -1 }));
+  let out = [];
+  for (let i = 0; i < lines.length; i += 1) {
+    if (i === insertAt) out.push(...fresh);
+    if (!drop.has(i)) out.push(lines[i]);
+  }
+  if (insertAt === lines.length) out.push(...fresh);
+
+  // 지운 자리 때문에 본문 끝에 남은 빈 줄 정리(원래부터 있던 끝 빈 줄·새로 쓴 줄 뒤의 빈 줄은 그대로)
+  if (drop.size) {
+    let removedLast = -1;
+    for (const i of drop) if (i > removedLast) removedLast = i;
+    let k = out.length - 1;
+    while (k >= 0 && out[k].orig >= 0 && isBlankLine(out[k].text)) k -= 1;
+    if (k < 0 || (out[k].orig >= 0 && out[k].orig < removedLast)) out = out.slice(0, k + 1);
+  }
+
+  if (head < 0 && list.length) {
+    const heading = { text: SUBTASK_HEADING, sep: nl, orig: -1 };
+    const last = out[out.length - 1];
+    if (!out.length || (out.length === 1 && last.text === '')) out = [heading, ...fresh];
+    else if (last.text === '' && isBlankLine(out[out.length - 2].text)) out = [...out.slice(0, -1), heading, ...fresh];
+    else if (isBlankLine(last.text)) out = [...out, heading, ...fresh];
+    else out = [...out, { text: '', sep: nl, orig: -1 }, heading, ...fresh];
+  }
+
+  // 줄바꿈: 마지막 줄 뒤에는 없고, 원래 마지막 줄 뒤에 줄이 이어지면 첫 줄바꿈 형식을 넣는다
+  const joined = [];
+  out.forEach((l, i) => {
+    if (i) joined.push(out[i - 1].sep || nl);
+    joined.push(l.text);
+  });
+  return joinParts(joined, true);
 }
 
 // ---------------------------------------------------------------------------

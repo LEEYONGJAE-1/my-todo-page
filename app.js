@@ -42,6 +42,15 @@ import {
   setDueInBody,
   withPriorityLabel,
   groupsOf,
+  setBodyField,
+  setSubtasks,
+  splitMemoMarker,
+  joinMemoMarker,
+  normalizeBodyField,
+  normalizeSubtasks,
+  stripInstanceMarkers,
+  BODY_FIELD_MAX_CHARS,
+  SUBTASK_MAX_CHARS,
 } from './parser.js';
 
 // ─────────────────────────────────────────────────────────────
@@ -111,6 +120,8 @@ export const MSG = Object.freeze({
   metaClosed: '이미 완료된 할 일입니다', // [✏ 변경] 최신 상태가 닫힘(409)
   metaNotTask: '할 일이 아니라 바꿀 수 없습니다', // [✏ 변경] PR·recurring·briefing(400)
   metaBadDue: '마감 날짜가 올바르지 않습니다(YYYY-MM-DD)',
+  // [✏ 변경] 세부 내용(완료 기준·메모·하위 작업) 충돌(409, kind 'conflict' — '이미 완료된 할 일입니다' 409(kind 'closed')와 구분)
+  metaConflict: '다른 곳에서 이 할 일의 세부 내용이 바뀌었습니다',
   unexpected: '처리 중 예기치 못한 오류가 발생했습니다. 새로고침 후 다시 시도하세요.',
 });
 
@@ -124,6 +135,10 @@ export class ApiError extends Error {
     this.githubMessage = typeof info.githubMessage === 'string' ? info.githubMessage : '';
     // 화면이 목록을 정리할 수 있도록 서버의 최신 이슈를 담을 수 있다(예: 이미 닫힌 이슈 409).
     if (info.issue && typeof info.issue === 'object') this.issue = info.issue;
+    // 같은 상태 코드의 오류를 구분하는 표시: [✏ 변경]의 409 는 'closed'(이미 완료) / 'conflict'(세부 내용 충돌), 400 은 'notTask'.
+    if (typeof info.kind === 'string' && info.kind) this.kind = info.kind;
+    // kind 'conflict': 다른 곳에서 바뀐 칸 ['criteria'|'memo'|'subtasks', …]
+    if (Array.isArray(info.conflicts)) this.conflicts = info.conflicts.slice();
   }
 }
 
@@ -650,7 +665,10 @@ export const REPLY_POLL_MS = 30 * 1000; // 🆘 후 자동 확인 간격
 export const REPLY_WATCH_MS = 6 * 60 * 1000; // 🆘 후 자동 확인 최대 시간
 // [✏ 변경] 날짜 칸에 입력하는 중이면 자동 확인(화면 다시 그리기)을 이만큼 미룬다 — 다시 그리면 날짜 칸이 새로 만들어져
 // 덜 친 연·월·일이 사라지고 이어 치는 숫자가 엉뚱한 칸에 들어가기 때문
+// (6차: 완료 기준·메모·하위 작업 글자 칸도 같다 — 다시 그리면 한글 조합 중인 글자가 끊긴다. 그 밖의 화면 다시 그리기도 이만큼씩 미룬다)
 export const EDIT_DEFER_MS = 1500;
+/** '입력 중'으로 보는 편집 패널 칸: 날짜, 완료 기준·메모·하위 작업 글자 칸 */
+const EDIT_FIELD_SEL = 'form.edit-panel input[type="date"], form.edit-panel input[type="text"]';
 export const REPLY_MAX_CHARS = 20000; // 화면에 그리는 답글 최대 길이
 export const REPLY_TRUNCATED_TEXT = '…(GitHub에서 전체 보기)';
 export const SAFE_LINK_PREFIX = 'https://github.com/';
@@ -1326,7 +1344,119 @@ export const META_TEXT = Object.freeze({
   listUpdated: '목록을 GitHub의 최신 상태로 고쳤습니다. 다른 항목도 바뀌었을 수 있으니 [목록 새로고침]을 누르세요.',
   needDate: '마감 날짜를 고르거나 [마감 없음]을 체크하세요.',
   badDate: '마감 날짜가 올바르지 않습니다. 날짜를 다시 고르세요.',
+  // ── 6차: 세부 내용(완료 기준·메모·하위 작업) ──
+  criteriaLabel: '완료 기준',
+  criteriaPlaceholder: '무엇이 되면 끝인가요? 예: 견적서를 김과장께 메일로 보냄',
+  memoLabel: '메모',
+  memoPlaceholder: '자료 위치·관련자 등',
+  sensitive: '금액·계약 조건·개인정보는 적지 말고 자료 위치만 적으세요.',
+  markerPrefix: '반복 회차 표지: ',
+  markerSuffix: ' (바꿀 수 없음)',
+  subtasksLegend: '하위 작업',
+  subtasksEmpty: '하위 작업이 없습니다',
+  subtaskAdd: '+ 하위 작업 추가',
+  subtaskHelp: 'Enter 키로 다음 줄을 추가합니다. 빈 줄은 저장하지 않습니다.',
+  subtaskLimit: '하위 작업은 50개까지 적을 수 있습니다.',
+  editingSubtasks: '편집 중에는 [✏ 변경] 패널에서 바꾸세요.',
+  editingApply: '편집 중에는 [✏ 변경] 패널을 닫은 뒤 반영하세요.',
+  criteriaTooLong: '완료 기준은 500자까지 적을 수 있습니다.',
+  memoTooLong: '메모는 500자까지 적을 수 있습니다.',
+  conflictHelp: '[내 내용으로 저장]을 누르면 지금 입력한 내용으로 덮어쓰고, [최신 내용 불러오기]를 누르면 입력한 내용을 버리고 GitHub의 최신 내용으로 다시 채웁니다.',
+  conflictChoose: '[✏ 변경] 패널에서 [내 내용으로 저장] 또는 [최신 내용 불러오기]를 고르세요.',
+  forceSave: '내 내용으로 저장',
+  reloadLatest: '최신 내용 불러오기',
+  reloaded: '최신 내용을 불러왔습니다. 다시 고친 뒤 [저장]을 누르세요.',
 });
+
+/** [✏ 변경]/[✏ 닫기] 버튼 aria-label 의 괄호 속 범위: '✏ 변경(우선순위·마감·완료 기준·메모·하위 작업): #N 제목' */
+export const EDIT_SCOPE_TEXT = '우선순위·마감·완료 기준·메모·하위 작업';
+
+/** 세부 내용 칸 이름(결과 문장·충돌 메시지). 순서 = 본문 형식·결과 문장 순서 */
+export const DETAIL_KEYS = Object.freeze(['criteria', 'memo', 'subtasks']);
+export const DETAIL_NAME = Object.freeze({ criteria: '완료 기준', memo: '메모', subtasks: '하위 작업' });
+/** [✏ 변경] 하위 작업 편집기 줄 수 상한(넘으면 [+ 하위 작업 추가] 비활성 + 안내). 이미 그보다 많은 본문은 그대로 저장한다. */
+export const SUBTASK_LIMIT = 50;
+export { BODY_FIELD_MAX_CHARS, SUBTASK_MAX_CHARS };
+const CRITERIA_UNSET = '(미정)';
+
+/** 'N번째 하위 작업은 200자까지 적을 수 있습니다.' */
+export function subtaskTooLongText(i) {
+  return `${i}번째 하위 작업은 ${SUBTASK_MAX_CHARS}자까지 적을 수 있습니다.`;
+}
+
+/** 충돌 메시지: '다른 곳에서 이 할 일의 세부 내용이 바뀌었습니다(바뀐 칸: 완료 기준·하위 작업)' */
+export function conflictText(fields) {
+  const names = DETAIL_KEYS.filter((k) => Array.isArray(fields) && fields.includes(k)).map((k) => DETAIL_NAME[k]);
+  return names.length ? `${MSG.metaConflict}(바뀐 칸: ${names.join('·')})` : MSG.metaConflict;
+}
+
+const oneLine = (s) => String(s ?? '').replace(/\s+/g, ' ').trim();
+/** 입력 글자 수(코드 포인트, parser.js 와 같은 기준 — 이미 정리된 '@ claude' 는 '@claude' 로 센다) */
+export function detailInputLength(s) {
+  return Array.from(oneLine(s).replace(/@ claude/gi, '@claude')).length;
+}
+
+/**
+ * 비교용 값(저장하면 parseBody 가 읽을 값). 완료 기준: 비면 '(미정)', 메모: 비면 null.
+ * normalizeBodyField 와 같고, 그 한도(500자)를 넘는 값(GitHub 에서 직접 고친 본문)은 던지지 않고 같은 방식으로 정리만 한다.
+ */
+function canonDetail(key, v) {
+  try {
+    return normalizeBodyField(key, v === null || v === undefined ? null : String(v));
+  } catch {
+    const s = sanitizeText(oneLine(v));
+    return s || (key === 'criteria' ? CRITERIA_UNSET : null);
+  }
+}
+
+/**
+ * 비교용 하위 작업 목록 [{text, done}] (normalizeSubtasks(list, { keep }) 와 같고, 200자를 넘는 줄도 던지지 않음).
+ * keep: 본문에 이미 있던 하위 작업(패널을 열 때 읽은 것 + 최신) — 그 글자 그대로의 줄은 표기를 떼지 않고 그대로 비교한다.
+ */
+function canonSubtasks(list, keep = []) {
+  const arr = Array.isArray(list) ? list : [];
+  try {
+    return normalizeSubtasks(arr, { keep });
+  } catch {
+    return arr
+      .map((s) => ({ text: sanitizeText(oneLine(s && typeof s === 'object' ? s.text : s)), done: Boolean(s && s.done) }))
+      .filter((s) => s.text);
+  }
+}
+
+function sameSubtasks(a, b) {
+  return a.length === b.length && a.every((s, i) => s.text === b[i].text && s.done === b[i].done);
+}
+
+/** 메모 입력에서 회차 표지 글자를 모두 뗀 사용자 메모(표지는 늘 최신 본문의 것을 쓴다). 비면 null. */
+function memoUserText(v) {
+  return stripInstanceMarkers(v) || null;
+}
+
+/**
+ * 행(카드/표) 제목 아래에 보여 줄 완료 기준·메모(parseBody 결과 → { criteria, memo }, 없으면 null).
+ * - 완료 기준: '(미정)'·빈 값이면 null.
+ * - 메모: 빈 값·기본값('홈페이지에서 등록')이면 null. 회차 표지(반복원본: #N / 회차: …)는 숨기고 사용자 메모만(없으면 null).
+ */
+export function rowDetailOf(fields) {
+  const f = fields && typeof fields === 'object' ? fields : {};
+  const crit = typeof f.criteria === 'string' ? f.criteria.trim() : '';
+  let memo = null;
+  if (typeof f.memo === 'string' && f.memo.trim()) {
+    const { marker, text } = splitMemoMarker(f.memo);
+    const t = marker ? text || '' : f.memo.trim();
+    memo = t && t !== DEFAULT_MEMO ? t : null;
+  }
+  return { criteria: crit && crit !== CRITERIA_UNSET ? crit : null, memo };
+}
+
+/** parser.js 의 TypeError(글자 수·형식) → 한국어 ApiError(400) */
+function detailValueError(key, e) {
+  const msg = e && typeof e.message === 'string' ? e.message : '';
+  if (key === 'subtasks') return new ApiError(msg ? `${msg}.`.replace(/\.\.$/, '.') : '하위 작업 형식이 잘못됐습니다.', 400);
+  if (/\d+자/.test(msg)) return new ApiError(key === 'criteria' ? META_TEXT.criteriaTooLong : META_TEXT.memoTooLong, 400);
+  return new ApiError(`${DETAIL_NAME[key]} 값이 올바르지 않습니다.`, 400);
+}
 
 /**
  * [✏ 변경] 마감으로 받는 날짜 범위(편집 패널 날짜 칸의 min·max 와 같다). 키보드로 연도를 덜 친 값(0202-10-30)이나
@@ -1354,24 +1484,105 @@ export function priorityText(p) {
  *    본문 = due 가 주어지고 parseBody(최신).due 와 다르면 setDueInBody(Due 줄만 바꾸기·넣기·지우기).
  * 3) 바꿀 것이 없으면 쓰지 않고 { issue: 최신, changed: [] }.
  * 4) 라벨을 바꾸면 먼저 ensureLabels([priority]).
- * 5) PATCH 한 번(api.updateIssue(n, { labels?, body? })) → { issue: 응답, changed: ['priority'?, 'due'?] }.
+ * 5) PATCH 한 번(api.updateIssue(n, { labels?, body? })) → { issue: 응답, changed: ['priority'?, 'due'?, 'criteria'?, 'memo'?, 'subtasks'?] }.
  *    GitHub REST 의 PATCH labels 는 이슈 라벨 전체를 그 배열로 바꾼다 → 다른 라벨(area·proj·waiting·stuck 등)도 최신 순서 그대로 넣는다.
  * 값이 잘못되면(p4, '2026-02-30', 범위(DUE_MIN~DUE_MAX) 밖의 '0202-10-30' 등) 요청 없이 ApiError(400).
+ *
+ * 6차 — 세부 내용(본문 줄만 고치고 나머지 줄·줄바꿈 형식은 그대로, 같은 PATCH 한 번에 함께):
+ *   change.criteria: string|null(비우면 '(미정)'), change.memo: string|null(사용자 메모 — 회차면 표지 뒤 부분, 비우면 줄 삭제·회차면 표지만),
+ *   change.subtasks: [{ text, done }](순서 그대로 전체 — 빈 줄은 무시). 주어지지 않은(undefined) 칸은 최신 값 그대로.
+ *   - 회차 메모: 최신 메모의 표지(반복원본: #N / 회차: YYYY-MM-DD)를 그대로 두고 사용자 부분만 바꾼다(change.memo 에 표지 글자가 들어 있어도 떼고 최신 표지를 쓴다).
+ *   - 충돌 검사(opts.base = 패널을 열 때 읽은 { criteria, memo, subtasks } 원래 값, opts.force 가 아니면): change 에 있는 세부 칸마다
+ *     최신 값이 base 와 다르고(다른 곳에서 바뀜) 내 값과도 다르면 충돌 → 쓰기 없이 ApiError(409, MSG.metaConflict,
+ *     { kind: 'conflict', conflicts: ['criteria'|'memo'|'subtasks'…], issue: 최신 }). 최신 값이 내 값과 같으면 충돌 아님.
+ *     base 에 없는 칸은 검사하지 않는다. 우선순위·마감은 충돌 검사 없음(5차 그대로).
+ *   - 비교는 저장 뒤 parseBody 가 읽을 값 기준(한 줄·@claude 정리, 완료 기준 빈 값 = '(미정)', 줄 모양만 다른 하위 작업은 같음).
+ *   - 글자 수(완료 기준·메모 500자, 하위 작업 200자) 초과·형식 오류는 요청 없이 ApiError(400). 검사는 change 에 든 칸만 한다
+ *     (GitHub 에서 길게 적어 둔 칸이 있어도 다른 칸만 바꾸면 저장된다).
+ *   - 하위 작업 중 본문에 이미 있던 줄(opts.base.subtasks 와 최신 본문의 하위 작업 — 글자 그대로)은 손대지 않은 줄로 보고
+ *     200자 검사·앞 표기(`- `·`* ` 등) 떼기를 하지 않는다(normalizeSubtasks 의 keep) — 한 줄만 고쳐도 다른 긴 줄·`- 3단계` 같은 줄은 그대로.
+ *   - 완료 기준과 새로 적거나 고친 하위 작업 줄의 회차 표지 글자(반복원본: #N / 회차: …)는 뗀다(표지는 메모에만 — 아침 작업이 잘못 알아보지 않게).
  */
 export async function updateTaskMeta(api, issue, change = {}, opts = {}) {
   const num = typeof issue === 'number' ? issue : issue && typeof issue === 'object' ? issue.number : null;
   if (!Number.isSafeInteger(num) || num <= 0) throw new ApiError('바꿀 할 일을 찾을 수 없습니다.', 400);
-  const { priority, due } = change && typeof change === 'object' ? change : {};
+  const c = change && typeof change === 'object' ? change : {};
+  const { priority, due } = c;
   if (priority !== undefined && !PRIORITY_KEYS.includes(priority)) {
     throw new ApiError(`우선순위는 p1·p2·p3 중 하나여야 합니다: ${String(priority)}`, 400);
   }
   if (due !== undefined && due !== null && !isDueInRange(due)) {
     throw new ApiError(`${MSG.metaBadDue}: ${String(due)}`, 400);
   }
+  // 세부 내용: 요청 전에 값 검사·정리(저장할 값)
+  const want = {};
+  if (c.criteria !== undefined) {
+    if (c.criteria !== null && typeof c.criteria !== 'string') throw detailValueError('criteria', null);
+    try {
+      want.criteria = normalizeBodyField('criteria', c.criteria);
+    } catch (e) {
+      throw detailValueError('criteria', e);
+    }
+  }
+  let memoText;
+  if (c.memo !== undefined) {
+    if (c.memo !== null && typeof c.memo !== 'string') throw detailValueError('memo', null);
+    memoText = memoUserText(c.memo);
+    try {
+      normalizeBodyField('memo', memoText); // 사용자 메모 글자 수
+    } catch (e) {
+      throw detailValueError('memo', e);
+    }
+  }
+  const o = opts && typeof opts === 'object' ? opts : {};
+  const base = o.base && typeof o.base === 'object' ? o.base : null;
+  // 패널을 열 때 읽은 하위 작업(본문에 이미 있던 줄 — 200자 검사·표기 떼기 없이 그대로 둔다)
+  const baseSubs = base && Array.isArray(base.subtasks) ? base.subtasks.filter((x) => typeof x === 'string' || (x && typeof x === 'object')) : [];
+  if (c.subtasks !== undefined) {
+    if (!Array.isArray(c.subtasks)) throw detailValueError('subtasks', null);
+    try {
+      want.subtasks = normalizeSubtasks(c.subtasks, { keep: baseSubs });
+    } catch (e) {
+      throw detailValueError('subtasks', e);
+    }
+  }
+
   const latest = await api.getIssue(num);
   if (!latest || typeof latest !== 'object') throw new ApiError(MSG.badResponse, 0);
-  if (latest.state === 'closed') throw new ApiError(MSG.metaClosed, 409, { issue: latest });
-  if (!isTask(latest)) throw new ApiError(MSG.metaNotTask, 400, { issue: latest });
+  if (latest.state === 'closed') throw new ApiError(MSG.metaClosed, 409, { issue: latest, kind: 'closed' });
+  if (!isTask(latest)) throw new ApiError(MSG.metaNotTask, 400, { issue: latest, kind: 'notTask' });
+
+  const body0 = typeof latest.body === 'string' ? latest.body : '';
+  const cur = parseBody(body0);
+  if (c.memo !== undefined) {
+    // 표지는 최신 본문의 것(없으면 없음) + 사용자 메모
+    want.memo = canonDetail('memo', joinMemoMarker(splitMemoMarker(cur.memo).marker, memoText));
+  }
+  // 본문에 이미 있던 하위 작업 = 패널을 열 때 읽은 것 + 최신 본문의 것(비교·저장 모두 같은 기준)
+  const keep = [...baseSubs, ...cur.subtasks];
+  if (c.subtasks !== undefined) {
+    try {
+      want.subtasks = normalizeSubtasks(c.subtasks, { keep });
+    } catch (e) {
+      throw detailValueError('subtasks', e);
+    }
+  }
+
+  // 충돌 검사(세부 칸만)
+  const inBase = (k) => Boolean(base) && Object.prototype.hasOwnProperty.call(base, k);
+  if (!o.force && base) {
+    const conflicts = [];
+    for (const k of ['criteria', 'memo']) {
+      if (!(k in want) || !inBase(k)) continue;
+      const now = canonDetail(k, cur[k]);
+      if (now !== canonDetail(k, base[k]) && now !== want[k]) conflicts.push(k);
+    }
+    if ('subtasks' in want && inBase('subtasks')) {
+      const now = canonSubtasks(cur.subtasks, keep);
+      if (!sameSubtasks(now, canonSubtasks(base.subtasks, keep)) && !sameSubtasks(now, want.subtasks)) conflicts.push('subtasks');
+    }
+    if (conflicts.length) throw new ApiError(MSG.metaConflict, 409, { kind: 'conflict', conflicts, issue: latest });
+  }
 
   const names = labelNames(latest);
   const pCount = names.filter((x) => PRIORITY_KEYS.includes(x)).length;
@@ -1381,14 +1592,25 @@ export async function updateTaskMeta(api, issue, change = {}, opts = {}) {
     patch.labels = withPriorityLabel(names, priority);
     changed.push('priority');
   }
-  const body = typeof latest.body === 'string' ? latest.body : '';
-  if (due !== undefined && parseBody(body).due !== due) {
+  let body = body0;
+  if (due !== undefined && cur.due !== due) {
     const next = setDueInBody(body, due);
     if (next !== body) {
-      patch.body = next;
+      body = next;
       changed.push('due');
     }
   }
+  for (const k of ['criteria', 'memo']) {
+    if (k in want && canonDetail(k, cur[k]) !== want[k]) {
+      body = setBodyField(body, k, want[k]);
+      changed.push(k);
+    }
+  }
+  if ('subtasks' in want && !sameSubtasks(canonSubtasks(cur.subtasks, keep), want.subtasks)) {
+    body = setSubtasks(body, want.subtasks, { keep: baseSubs });
+    changed.push('subtasks');
+  }
+  if (body !== body0) patch.body = body;
   if (!changed.length) return { issue: latest, changed };
 
   if (patch.labels) await ensureLabels(api, [priority], (opts && opts.labelCache) || null);
@@ -1417,23 +1639,61 @@ export function roParticle(text) {
  * [✏ 변경] 결과 문장(번호 뒤에 붙인다). 날짜는 마감 칸과 같은 formatDue('10/20(화) · D-6'), 조사는 roParticle.
  * '우선순위를 p1(긴급)로, 마감을 10/20(화) · D-5로 바꿨습니다' / '우선순위를 p1(긴급)로 바꿨습니다' / '마감을 10/30(금) · D-16으로 바꿨습니다'
  * / '마감을 없앴습니다' / '우선순위를 p1(긴급)로 바꾸고 마감을 없앴습니다' / (바뀐 것 없음) '바뀐 내용이 없습니다'
+ * 6차 — 세부 내용이 바뀌면 그 이름을 '·'로 이어 붙이고(하위 작업은 저장 뒤 개수) 끝에 '을/를 바꿨습니다':
+ * '완료 기준·메모·하위 작업(3개)을 바꿨습니다' / 우선순위·마감과 함께면 앞 문장을 '…바꾸고'·'…없애고'로 이어서
+ * '우선순위를 p1(긴급)로 바꾸고 메모를 바꿨습니다' / '우선순위를 p1(긴급)로, 마감을 10/20(화) · D-5로 바꾸고 하위 작업(2개)을 바꿨습니다'
+ * / '마감을 없애고 완료 기준을 바꿨습니다' / '우선순위를 p1(긴급)로 바꾸고 마감을 없애고 메모를 바꿨습니다'.
  */
 export function metaChangeText(issue, changed, today) {
   const list = Array.isArray(changed) ? changed : [];
   const prio = list.includes('priority') ? priorityText(priorityOf(issue)) : null;
   const dueChanged = list.includes('due');
-  if (!prio && !dueChanged) return META_TEXT.noChange;
+  const detail = detailChangeText(issue, list);
+  if (!prio && !dueChanged && !detail) return META_TEXT.noChange;
   const due = dueChanged ? parseBody(issue && issue.body).due : null;
   const dueShown = due ? formatDue(due, today) : '';
   const dueText = due ? `마감을 ${dueShown}${roParticle(dueShown)}` : null;
-  if (prio && dueChanged) return due ? `우선순위를 ${prio}로, ${dueText} 바꿨습니다` : `우선순위를 ${prio}로 바꾸고 ${META_TEXT.dueRemoved}`;
-  if (prio) return `우선순위를 ${prio}로 바꿨습니다`;
-  return due ? `${dueText} 바꿨습니다` : META_TEXT.dueRemoved;
+  if (!detail) {
+    if (prio && dueChanged) return due ? `우선순위를 ${prio}로, ${dueText} 바꿨습니다` : `우선순위를 ${prio}로 바꾸고 ${META_TEXT.dueRemoved}`;
+    if (prio) return `우선순위를 ${prio}로 바꿨습니다`;
+    return due ? `${dueText} 바꿨습니다` : META_TEXT.dueRemoved;
+  }
+  const tail = `${detail}${objectParticle(detail)} 바꿨습니다`;
+  if (!prio && !dueChanged) return tail;
+  let head;
+  if (prio && dueChanged) head = due ? `우선순위를 ${prio}로, ${dueText} 바꾸고` : `우선순위를 ${prio}로 바꾸고 마감을 없애고`;
+  else if (prio) head = `우선순위를 ${prio}로 바꾸고`;
+  else head = due ? `${dueText} 바꾸고` : '마감을 없애고';
+  return `${head} ${tail}`;
 }
 
-/** [✏ 변경] 결과에 덧붙일 안내: 마감이 지났으면 '이미 지난 날짜라 🔴 지연에 표시됩니다', (지나지 않은) 대기 중이면 그대로 ⏳ 대기 중. */
+/** 바뀐 세부 칸 이름: '완료 기준·메모·하위 작업(3개)' (없으면 null). 하위 작업 개수는 issue(저장 뒤) 본문 기준. */
+export function detailChangeText(issue, changed) {
+  const list = Array.isArray(changed) ? changed : [];
+  const parts = DETAIL_KEYS.filter((k) => list.includes(k)).map((k) =>
+    k === 'subtasks' ? `${DETAIL_NAME.subtasks}(${parseBody(issue && issue.body).subtasks.length}개)` : DETAIL_NAME[k],
+  );
+  return parts.length ? parts.join('·') : null;
+}
+
+/**
+ * 목적격 조사 '을'/'를': 끝 글자(끝의 괄호 묶음 '(3개)' 는 건너뜀 — 괄호 앞 말에 맞춘다)의 받침 유무.
+ * '하위 작업(3개)' → '을', '메모' → '를', '완료 기준' → '을'. 한글이 아니면 '를'.
+ */
+export function objectParticle(text) {
+  const s = String(text ?? '').trim().replace(/\s*\([^()]*\)$/, '');
+  const code = s.charCodeAt(s.length - 1);
+  if (code >= 0xac00 && code <= 0xd7a3) return (code - 0xac00) % 28 ? '을' : '를';
+  return '를';
+}
+
+/**
+ * [✏ 변경] 결과에 덧붙일 안내: 마감이 지났으면 '이미 지난 날짜라 🔴 지연에 표시됩니다', (지나지 않은) 대기 중이면 그대로 ⏳ 대기 중.
+ * 목록 위치에 관한 안내라 우선순위·마감을 바꿨을 때만 붙인다(세부 내용만 바꾸면 안내 없음).
+ */
 export function metaChangeNotes(issue, changed, today) {
   if (!Array.isArray(changed) || !changed.length) return [];
+  if (!changed.includes('priority') && !changed.includes('due')) return [];
   const due = parseBody(issue && issue.body).due;
   if (due && due < today) return [META_TEXT.pastDue];
   if (labelNames(issue).includes('waiting')) return [META_TEXT.waitingStays];
@@ -1695,6 +1955,8 @@ function boot() {
     edits: new Map(), // number → [✏ 변경] 편집 패널 상태 {group, origPriority, origDue, priority, due, noDue, lastDue}
   };
   let editAt = new Map(); // number → 편집 패널을 그리는 그룹(같은 이슈가 🔴·⏳ 두 그룹에 있어도 패널은 한 곳)
+  let subSeq = 0; // [✏ 변경] 하위 작업 편집기 줄 번호(줄마다 고유 — 순서를 바꿔도 id·포커스가 그 줄을 따라간다)
+  let renderDeferTimer = null; // 입력 중이라 미룬 다시 그리기
   let msgState = null;
   let undoTimer = null;
   let noticeSig = '';
@@ -1753,11 +2015,54 @@ function boot() {
     if (t && !t.disabled) t.focus({ preventScroll: true });
   }
 
+  /** 글자 칸의 커서·선택 범위(다시 그린 뒤 되살리기용). 글자 칸이 아니면 null. */
+  function selectionOf(a) {
+    if (!a || a.tagName !== 'INPUT' || a.type !== 'text' || !a.id) return null;
+    try {
+      return { id: a.id, start: a.selectionStart, end: a.selectionEnd, dir: a.selectionDirection || 'none' };
+    } catch {
+      return null;
+    }
+  }
+
+  function restoreSelection(sel) {
+    const a = document.activeElement;
+    if (!sel || !a || a.id !== sel.id || a.type !== 'text' || sel.start == null) return;
+    try {
+      a.setSelectionRange(sel.start, sel.end ?? sel.start, sel.dir);
+    } catch {
+      /* 무시 */
+    }
+  }
+
   // ── 렌더링 ───────────────────────────────────────────
-  function render() {
+  /**
+   * 화면 다시 그리기. 편집 패널 칸에 입력 중이면(editingField) EDIT_DEFER_MS 뒤로 미룬다 — 칸이 새로 만들어지면
+   * 덜 친 날짜·한글 조합이 끊기기 때문(그사이 바뀐 상태는 미룬 다시 그리기가 한 번에 반영). 입력 중인 패널의 항목을 처리 중이면 미루지 않는다.
+   * opts.now: 패널 안의 동작(줄 추가·이동·삭제, 열기·닫기, 그 항목의 저장)처럼 지금 그려야 하는 경우.
+   * 다시 그린 뒤에는 포커스(id → data-fkey)와 글자 칸의 커서 위치를 되살린다.
+   */
+  function render(opts = null) {
+    if (!(opts && opts.now) && editingField()) {
+      const en = editingIssue();
+      if (en == null || !S.busy.has(issueKey(en))) {
+        if (renderDeferTimer === null) {
+          renderDeferTimer = setTimeout(() => {
+            renderDeferTimer = null;
+            render();
+          }, EDIT_DEFER_MS);
+        }
+        return;
+      }
+    }
+    if (renderDeferTimer !== null) {
+      clearTimeout(renderDeferTimer);
+      renderDeferTimer = null;
+    }
     const today = todayKST(); // 매번 다시 계산
     S.today = today;
     const focus = activeIdInApp();
+    const sel = selectionOf(document.activeElement);
     renderTop(today);
     renderStatus();
     renderGroups(today);
@@ -1765,7 +2070,10 @@ function boot() {
     renderRecurring();
     renderNotices();
     els.inputBtn.disabled = S.busy.has('input');
-    if (focus && document.activeElement !== byId(focus.id)) restoreFocus(focus);
+    if (focus && document.activeElement !== byId(focus.id)) {
+      restoreFocus(focus);
+      restoreSelection(sel);
+    }
   }
 
   function renderTop(today) {
@@ -1951,6 +2259,7 @@ function boot() {
     const title = issue.title || '(제목 없음)';
     const projects = projectsOf(labels);
     const comments = Number.isSafeInteger(issue.comments) && issue.comments > 0 ? issue.comments : 0;
+    const rowDetail = rowDetailOf(f);
     // 중간 폭(641~999px)에서는 우선순위·영역·프로젝트·예상 열을 숨기고 제목 아래 한 줄로 보여 준다(CSS로 전환)
     const metaInline = el(
       'p',
@@ -1974,7 +2283,9 @@ function boot() {
         comments ? el('span', { class: 'badge badge-comments', title: `댓글 ${comments}개` }, `💬 ${comments}`) : null,
       ),
       metaInline,
+      detailLine('criteria', rowDetail.criteria, n),
       f.next ? el('p', { class: 'next-step' }, el('span', { class: 'next-key' }, '다음:'), ' ', f.next) : null,
+      detailLine('memo', rowDetail.memo, n),
       renderSubtasks(issue, f.subtasks, busy, groupKey),
       renderReplyPanel(issue, groupKey, busy),
     );
@@ -2030,7 +2341,7 @@ function boot() {
             disabled: busy,
             'aria-expanded': String(editOpen),
             'aria-controls': editOpen ? `edit-${groupKey}-${n}` : null,
-            'aria-label': editOpen ? `✏ 닫기(우선순위·마감 변경): #${n} ${title}` : `✏ 우선순위·마감 변경: #${n} ${title}`,
+            'aria-label': `${editOpen ? '✏ 닫기' : '✏ 변경'}(${EDIT_SCOPE_TEXT}): #${n} ${title}`,
             onclick: () => onEditToggle(n, groupKey),
           },
           editOpen ? '✏ 닫기' : '✏ 변경',
@@ -2081,12 +2392,29 @@ function boot() {
     );
   }
 
+  /**
+   * 행의 '완료 기준: …'·'메모: …' 한 줄(제목 아래 작은 글씨, 길면 한 줄 말줄임 — 하위 작업을 펼치면 전체, 전체는 [✏ 변경] 패널에서도).
+   * 값이 없으면 줄 없음(rowDetailOf 가 정한다).
+   */
+  function detailLine(key, value, n) {
+    if (!value) return null;
+    return el(
+      'p',
+      { class: `detail-line detail-${key}${S.expanded.has(n) ? ' is-full' : ''}` },
+      el('span', { class: 'detail-key' }, `${DETAIL_NAME[key]}:`),
+      ' ',
+      value, // 값은 글자 그대로(말줄임은 p 가 잘라 보여 준다 — 화면 밖으로 넘치는 요소를 만들지 않게 감싸지 않는다)
+    );
+  }
+
   function renderSubtasks(issue, subtasks, busy, groupKey) {
     if (!Array.isArray(subtasks) || subtasks.length === 0) return null;
     const n = issue.number;
     const { done, total } = checklistProgress(issue.body);
     if (!total) return null;
     const expanded = S.expanded.has(n);
+    // 같은 항목의 [✏ 변경] 패널이 열려 있으면 여기서는 체크하지 않는다(패널의 하위 작업과 서로 덮어쓰지 않게)
+    const editing = S.edits.has(n);
     const pct = Math.round((done / total) * 100);
     const fill = el('span', { class: 'bar-fill' });
     fill.style.width = `${pct}%`; // CSSOM — CSP style-src 영향 없음
@@ -2139,20 +2467,24 @@ function boot() {
           id,
           dataset: { fkey: `chk-${n}-${index}` },
           checked: Boolean(s.done),
-          disabled: busy,
+          disabled: busy || editing,
+          'aria-describedby': editing ? `subs-lock-${groupKey}-${n}` : null,
         });
         box.addEventListener('change', () => onSubtaskToggle(n, { index, text: s.text }, box.checked));
-        ul.append(el('li', null, el('label', { class: s.done ? 'is-done' : null }, box, el('span', null, s.text))));
+        ul.append(el('li', null, el('label', { class: `${s.done ? 'is-done' : ''}${editing ? ' is-locked' : ''}`.trim() || null }, box, el('span', null, s.text))));
       });
       wrap.append(ul);
+      if (editing) wrap.append(el('p', { class: 'sub-lock', id: `subs-lock-${groupKey}-${n}` }, META_TEXT.editingSubtasks));
     }
     return wrap;
   }
 
-  // ── [✏ 변경] 우선순위·마감 편집 패널 (행 아래 한 줄) ──────
+  // ── [✏ 변경] 편집 패널 (행 아래 한 줄): 우선순위·마감·완료 기준·메모·하위 작업 ──────
   /**
    * 편집 패널은 S.edits 의 상태로 매번 다시 그린다(🆘 답변 패널처럼 render() 를 거쳐도 열림·입력값이 유지된다).
    * 입력 요소마다 id(그룹 포함)와 data-fkey(그룹 무관)를 두어 다시 그린 뒤에도 키보드 포커스가 제자리로 돌아온다.
+   * 글자 칸은 입력할 때마다 상태에 적어 두고(input 이벤트), 다시 그리면 커서 위치도 되살린다(render 의 restoreSelection).
+   * 하위 작업 줄은 줄마다 고유 번호(s.id)로 id 를 만든다 — 순서를 바꿔도 같은 줄의 버튼으로 포커스가 돌아온다.
    */
   function renderEditRow(issue, groupKey) {
     const n = issue.number;
@@ -2214,17 +2546,47 @@ function boot() {
       }
     });
 
+    // 완료 기준·메모: 한 줄 입력(최대 500자). 입력값은 상태에 적어 두어 다시 그려도 남는다.
+    const textInput = (what, value, attrs) => {
+      const input = el('input', {
+        type: 'text',
+        id: `edit-${what}-${sfx}`,
+        class: 'edit-text',
+        dataset: { fkey: `edit-${what}-${n}` },
+        maxlength: String(BODY_FIELD_MAX_CHARS),
+        autocomplete: 'off',
+        enterkeyhint: 'done',
+        disabled: busy,
+        ...attrs,
+      });
+      input.value = value;
+      return input;
+    };
+    const crit = textInput('crit', d.criteria, { placeholder: META_TEXT.criteriaPlaceholder });
+    crit.addEventListener('input', () => {
+      d.criteria = crit.value;
+    });
+    const markerId = `edit-marker-${sfx}`;
+    const memoNoteId = `edit-memo-note-${sfx}`;
+    const memo = textInput('memo', d.memo, {
+      placeholder: META_TEXT.memoPlaceholder,
+      'aria-describedby': d.marker ? `${markerId} ${memoNoteId}` : memoNoteId,
+    });
+    memo.addEventListener('input', () => {
+      d.memo = memo.value;
+    });
+
     const form = el(
       'form',
       {
         class: 'edit-panel',
         id: `edit-${sfx}`,
         dataset: { editFor: n },
-        'aria-label': `#${n} 우선순위·마감 변경`,
+        'aria-label': `#${n} 할 일 변경`,
         'aria-describedby': hintId,
         'aria-busy': busy ? 'true' : null,
         autocomplete: 'off',
-        novalidate: true, // 날짜 확인은 브라우저 말풍선 대신 앱 메시지로(onEditSave)
+        novalidate: true, // 날짜·글자 수 확인은 브라우저 말풍선 대신 앱 메시지로(onEditSave)
       },
       el('fieldset', { class: 'edit-prio' }, el('legend', null, '우선순위'), el('div', { class: 'edit-opts' }, radios)),
       el(
@@ -2234,7 +2596,18 @@ function boot() {
         date,
         el('label', { class: 'edit-check', for: noDueId }, noDue, ' 마감 없음'),
       ),
+      el('div', { class: 'edit-field' }, el('label', { class: 'edit-field-label', for: crit.id }, META_TEXT.criteriaLabel), crit),
+      el(
+        'div',
+        { class: 'edit-field' },
+        el('label', { class: 'edit-field-label', for: memo.id }, META_TEXT.memoLabel),
+        d.marker ? el('p', { class: 'edit-marker', id: markerId }, `${META_TEXT.markerPrefix}${d.marker}${META_TEXT.markerSuffix}`) : null,
+        memo,
+        el('p', { class: 'edit-note', id: memoNoteId }, META_TEXT.sensitive),
+      ),
+      renderSubtaskEditor(n, d, sfx, busy),
       el('p', { class: 'edit-hint', id: hintId }, META_TEXT.hint),
+      d.conflict ? renderEditConflict(n, d, sfx, busy) : null,
       el(
         'div',
         { class: 'edit-actions' },
@@ -2246,7 +2619,7 @@ function boot() {
             id: `btn-esave-${sfx}`,
             dataset: { fkey: `btn-esave-${n}` },
             disabled: busy,
-            'aria-label': `${busy ? '저장 중…' : '저장'}: #${n} 우선순위·마감 변경`,
+            'aria-label': `${busy ? '저장 중…' : '저장'}: #${n} 할 일 변경`,
           },
           busy ? '저장 중…' : '저장',
         ),
@@ -2257,7 +2630,7 @@ function boot() {
             id: `btn-ecancel-${sfx}`,
             dataset: { fkey: `btn-ecancel-${n}` },
             disabled: busy,
-            'aria-label': `취소: #${n} 우선순위·마감 변경`,
+            'aria-label': `취소: #${n} 할 일 변경`,
             onclick: () => onEditCancel(n),
           },
           '취소',
@@ -2275,6 +2648,145 @@ function boot() {
       }
     });
     return el('tr', { class: 'edit-row' }, el('td', { class: 'c-edit', colspan: String(COLUMNS.length) }, form));
+  }
+
+  /**
+   * 하위 작업 편집기: 줄마다 [완료 체크] [글자 칸] [▲][▼][삭제], 맨 아래 [+ 하위 작업 추가](Enter 로도 다음 줄 추가).
+   * 0개면 '하위 작업이 없습니다', SUBTASK_LIMIT(50)줄이면 추가 버튼을 막고 안내. 빈 줄은 저장할 때 버린다.
+   */
+  function renderSubtaskEditor(n, d, sfx, busy) {
+    const subs = d.subs;
+    const total = subs.length;
+    const atLimit = total >= SUBTASK_LIMIT;
+    const helpId = `edit-subhelp-${sfx}`;
+    const limitId = `edit-sublimit-${sfx}`;
+    const rows = subs.map((s, i) => {
+      const k = i + 1;
+      const rid = `${sfx}-${s.id}`;
+      const fk = `${n}-${s.id}`;
+      const doneId = `edit-subdone-${rid}`;
+      const textId = `edit-subtext-${rid}`;
+      const box = el('input', { type: 'checkbox', id: doneId, dataset: { fkey: `edit-subdone-${fk}` }, checked: Boolean(s.done), disabled: busy });
+      const text = el('input', {
+        type: 'text',
+        id: textId,
+        class: 'edit-text sub-edit-text',
+        dataset: { fkey: `edit-subtext-${fk}` },
+        maxlength: String(SUBTASK_MAX_CHARS),
+        autocomplete: 'off',
+        enterkeyhint: 'next',
+        'aria-describedby': atLimit ? `${helpId} ${limitId}` : helpId, // 50줄이면 Enter 로 줄이 생기지 않는다는 안내도
+        disabled: busy,
+      });
+      text.value = s.text;
+      const li = el('li', { class: `sub-edit-row${s.done ? ' is-done' : ''}` });
+      box.addEventListener('change', () => {
+        s.done = box.checked;
+        li.classList.toggle('is-done', s.done);
+      });
+      text.addEventListener('input', () => {
+        s.text = text.value;
+      });
+      text.addEventListener('keydown', (e) => {
+        // Enter: 이 줄 바로 아래에 새 줄(한글 조합 중 Enter 는 글자 확정이므로 건드리지 않음). 폼 저장으로 넘어가지 않게 막는다.
+        if (e.key === 'Enter' && !e.isComposing && e.keyCode !== 229) {
+          e.preventDefault();
+          onSubAdd(n, s.id);
+        }
+      });
+      const btn = (kind, label, aria, off, run) =>
+        el(
+          'button',
+          {
+            type: 'button',
+            class: `sub-edit-btn sub-edit-${kind}`,
+            id: `btn-sub${kind}-${rid}`,
+            dataset: { fkey: `btn-sub${kind}-${fk}` },
+            disabled: busy || off,
+            'aria-label': aria,
+            onclick: run,
+          },
+          label,
+        );
+      li.append(
+        el('label', { class: 'sub-edit-check', for: doneId }, box, el('span', { class: 'visually-hidden' }, `${k}번째 하위 작업 완료`)),
+        el('label', { class: 'visually-hidden', for: textId }, `${k}번째 하위 작업`),
+        text,
+        el(
+          'div',
+          { class: 'sub-edit-btns' },
+          btn('up', '▲', `${k}번째 하위 작업 위로`, i === 0, () => onSubMove(n, s.id, -1)),
+          btn('down', '▼', `${k}번째 하위 작업 아래로`, i === total - 1, () => onSubMove(n, s.id, 1)),
+          btn('del', '삭제', `${k}번째 하위 작업 삭제`, false, () => onSubDelete(n, s.id)),
+        ),
+      );
+      return li;
+    });
+    return el(
+      'fieldset',
+      { class: 'edit-subs' },
+      el('legend', null, META_TEXT.subtasksLegend),
+      total ? el('ol', { class: 'sub-edit-list' }, rows) : el('p', { class: 'edit-note sub-edit-empty' }, META_TEXT.subtasksEmpty),
+      el(
+        'div',
+        { class: 'sub-edit-foot' },
+        el(
+          'button',
+          {
+            type: 'button',
+            class: 'sub-add',
+            id: `btn-subadd-${sfx}`,
+            dataset: { fkey: `btn-subadd-${n}` },
+            disabled: busy || atLimit,
+            'aria-describedby': atLimit ? limitId : null,
+            onclick: () => onSubAdd(n, null),
+          },
+          META_TEXT.subtaskAdd,
+        ),
+      ),
+      atLimit ? el('p', { class: 'edit-note', id: limitId }, META_TEXT.subtaskLimit) : null,
+      total ? el('p', { class: 'edit-note', id: helpId }, META_TEXT.subtaskHelp) : null,
+    );
+  }
+
+  /** 충돌 안내(패널 안): 바뀐 칸 + [내 내용으로 저장](덮어쓰기) [최신 내용 불러오기](내 입력 버리기). 패널·입력값은 그대로. */
+  function renderEditConflict(n, d, sfx, busy) {
+    const textId = `edit-conflict-${sfx}`;
+    const helpId = `edit-conflict-help-${sfx}`;
+    return el(
+      'div',
+      { class: 'edit-conflict' },
+      el('p', { class: 'edit-conflict-text', id: textId }, `#${n} ${conflictText(d.conflict.fields)}`),
+      el('p', { class: 'edit-note', id: helpId }, META_TEXT.conflictHelp),
+      el(
+        'div',
+        { class: 'edit-conflict-actions' },
+        el(
+          'button',
+          {
+            type: 'button',
+            id: `btn-eforce-${sfx}`,
+            dataset: { fkey: `btn-eforce-${n}` },
+            disabled: busy,
+            'aria-describedby': `${textId} ${helpId}`,
+            onclick: () => onEditSave(n, { force: true }),
+          },
+          META_TEXT.forceSave,
+        ),
+        el(
+          'button',
+          {
+            type: 'button',
+            id: `btn-ereload-${sfx}`,
+            dataset: { fkey: `btn-ereload-${n}` },
+            disabled: busy,
+            'aria-describedby': `${textId} ${helpId}`,
+            onclick: () => onEditReload(n),
+          },
+          META_TEXT.reloadLatest,
+        ),
+      ),
+    );
   }
 
   // ── 🆘 Claude 답변 패널 ───────────────────────────────
@@ -2369,6 +2881,9 @@ function boot() {
       // 표시용 정리(상태 줄·/todo-stuck 표기·반영 안내 줄 제거). [본문에 반영]은 원문(reply.body)으로 계산한다.
       kids.push(el('div', { class: 'reply-body' }, renderReplyBlocks(replyBlocks(cleanReplyForDisplay(reply.body)))));
       const info = applyInfo(issue, reply);
+      // 같은 항목의 [✏ 변경] 패널이 열려 있으면 반영하지 않는다(패널의 하위 작업 목록과 서로 덮어쓰지 않게)
+      const editing = S.edits.has(n);
+      const lockId = `apply-lock-${groupKey}-${n}`;
       kids.push(
         el(
           'div',
@@ -2377,11 +2892,12 @@ function boot() {
             'button',
             {
               type: 'button',
-              class: info.enabled ? 'primary' : null,
+              class: info.enabled && !editing ? 'primary' : null,
               id: `btn-apply-${groupKey}-${n}`,
               dataset: { fkey: `btn-apply-${n}` },
-              disabled: busy || !info.enabled,
+              disabled: busy || !info.enabled || editing,
               'aria-label': `${info.label}: #${n}`,
+              'aria-describedby': editing && info.enabled ? lockId : null,
               onclick: () => onApplyReply(n),
             },
             info.label,
@@ -2389,6 +2905,7 @@ function boot() {
           reload,
         ),
       );
+      if (editing && info.enabled) kids.push(el('p', { class: 'reply-note', id: lockId }, META_TEXT.editingApply));
     } else if (!entry.loading) {
       if (!entry.error) kids.push(el('p', { class: 'reply-empty' }, '아직 Claude 답변이 없습니다'));
       const c = entry.latest;
@@ -2424,7 +2941,7 @@ function boot() {
       [...S.notices.values()].map((nt) => {
         const entry = S.replies.get(nt.n);
         const info = nt.kind === 'arrived' ? applyInfo(S.issues.get(nt.n) || { number: nt.n, body: '' }, entry && entry.reply) : null;
-        return [nt.n, nt.kind, nt.state || '', nt.message || '', info && info.label, info && info.enabled, S.busy.has(issueKey(nt.n))];
+        return [nt.n, nt.kind, nt.state || '', nt.message || '', info && info.label, info && info.enabled, S.busy.has(issueKey(nt.n)), S.edits.has(nt.n)];
       }),
     );
     if (sig === noticeSig && els.notices.childNodes.length === S.notices.size) return;
@@ -2441,15 +2958,20 @@ function boot() {
         if (nt.state === 'error') lines.push('Claude 실행은 오류로 끝났지만 답변 내용은 볼 수 있습니다.');
         const entry = S.replies.get(n);
         const info = applyInfo(S.issues.get(n) || { number: n, body: '' }, entry && entry.reply);
+        const editing = S.edits.has(n); // [✏ 변경] 패널이 열려 있으면 반영 버튼은 잠근다
+        // 잠금 안내 줄은 버튼 설명(aria-describedby)으로도 잇는다(답변 칸의 같은 버튼과 같게)
+        const lockId = editing && info.enabled ? `napply-lock-${n}` : null;
+        if (lockId) lines.push({ id: lockId, text: META_TEXT.editingApply });
         actions.push(
           el('button', { type: 'button', id: `btn-nview-${n}`, onclick: () => onNoticeView(n) }, '답변 보기'),
           el(
             'button',
             {
               type: 'button',
-              class: info.enabled ? 'primary' : null,
+              class: info.enabled && !editing ? 'primary' : null,
               id: `btn-napply-${n}`,
-              disabled: S.busy.has(issueKey(n)) || !info.enabled,
+              disabled: S.busy.has(issueKey(n)) || !info.enabled || editing,
+              'aria-describedby': lockId,
               onclick: () => onApplyReply(n),
             },
             info.label,
@@ -2464,7 +2986,7 @@ function boot() {
       const card = el(
         'div',
         { class: `msg-card notice tone-${tone}`, dataset: { noticeFor: n } },
-        el('div', { class: 'msg-text' }, lines.map((ln) => el('p', null, ln))),
+        el('div', { class: 'msg-text' }, lines.map((ln) => (ln && typeof ln === 'object' && !Array.isArray(ln) && ln.id ? el('p', { id: ln.id }, ln.text) : el('p', null, ln)))),
         actions.length ? el('div', { class: 'msg-actions' }, actions) : null,
         el(
           'button',
@@ -2765,7 +3287,8 @@ function boot() {
       showError(e);
     } finally {
       S.busy.delete(key);
-      render();
+      // 이 항목의 편집 패널 칸에 포커스가 남아 있으면(저장 결과로 패널을 닫는 등) 미루지 않고 그린다
+      render({ now: editingIssue() === n });
       restoreFocus(focusId);
     }
     return true;
@@ -3230,10 +3753,80 @@ function boot() {
     b.focus({ preventScroll: true });
   }
 
-  /** 편집 패널의 날짜 칸에 키보드 포커스가 있으면 true (입력 중 — 배경 작업이 화면을 다시 그리지 않게 한다) */
-  function editingDueField() {
+  /**
+   * 편집 패널의 입력 칸(날짜·완료 기준·메모·하위 작업 글자 칸)에 키보드 포커스가 있으면 true — 입력 중.
+   * 배경 작업(🆘 자동 확인·날짜 바뀜)은 이때 화면을 다시 그리지 않고 미룬다(5차 R5UI-2 를 6차 글자 칸까지 넓힘):
+   * 다시 그리면 칸이 새로 만들어져 덜 친 날짜·한글 조합 중인 글자가 끊기기 때문.
+   */
+  function editingField() {
     const a = document.activeElement;
-    return Boolean(a && a.matches && a.matches('form.edit-panel input[type="date"]') && els.app.contains(a));
+    return Boolean(a && a.matches && a.matches(EDIT_FIELD_SEL) && els.app.contains(a));
+  }
+
+  /** 입력 중인 편집 패널의 이슈 번호(없으면 null) */
+  function editingIssue() {
+    if (!editingField()) return null;
+    const f = document.activeElement.closest('form.edit-panel');
+    const v = f ? Number(f.dataset.editFor) : NaN;
+    return Number.isSafeInteger(v) ? v : null;
+  }
+
+  /** 키보드 포커스가 아무 데도 없으면(본문·사라진 요소) true — 처리 뒤 포커스를 옮겨도 사용자가 옮겨 간 자리를 빼앗지 않는다 */
+  function focusFree() {
+    const a = document.activeElement;
+    return !a || a === document.body || !a.isConnected;
+  }
+
+  /** 편집 패널 안의 요소로 포커스: id = `${prefix}-${그룹}-${n}`(rowId 가 있으면 `-${rowId}`). 화면 밖이면 가까운 쪽으로 스크롤. */
+  function focusEditTarget(n, prefix, rowId = null) {
+    const g = editAt.get(n);
+    if (!g) return false;
+    const t = byId(rowId == null ? `${prefix}-${g}-${n}` : `${prefix}-${g}-${n}-${rowId}`);
+    if (!t || t.disabled) return false;
+    t.focus({ preventScroll: true });
+    const r = t.getBoundingClientRect();
+    if (r.top < 0 || r.bottom > window.innerHeight) {
+      try {
+        t.scrollIntoView({ block: 'nearest' });
+      } catch {
+        /* 무시 */
+      }
+    }
+    return true;
+  }
+
+  /** 이슈 → 편집 패널 상태(열 때·[최신 내용 불러오기]). base 는 충돌 확인용 원래 값(parseBody 그대로). */
+  function editStateFrom(issue, groupKey) {
+    const f = parseBody(issue.body);
+    const due = f.due;
+    const p = priorityOf(issue);
+    // pCount: 열 때의 p 라벨 수. 1개가 아니면(GitHub에서 2개를 붙였거나 하나도 없음) 저장할 때 고른 우선순위를 그대로 보내
+    // updateTaskMeta 가 p 라벨을 하나로 정리하게 한다(같은 값을 골라도).
+    const pCount = labelNames(issue).filter((x) => PRIORITY_KEYS.includes(x)).length;
+    const criteria = f.criteria && f.criteria !== CRITERIA_UNSET ? f.criteria : ''; // '(미정)'은 빈 칸으로 보여 준다
+    const { marker, text } = splitMemoMarker(f.memo); // 회차 표지는 읽기 전용, 칸에는 사용자 메모만
+    const memo = marker ? text || '' : f.memo || '';
+    const subs = f.subtasks.map((s) => ({ id: ++subSeq, text: s.text, done: s.done }));
+    return {
+      group: groupKey,
+      origPriority: p,
+      origDue: due,
+      pCount,
+      priority: p,
+      due: due || '',
+      noDue: !due,
+      lastDue: '',
+      base: { criteria: f.criteria, memo: f.memo, subtasks: f.subtasks.map((s) => ({ text: s.text, done: s.done })) },
+      origCriteria: criteria,
+      criteria,
+      marker,
+      origMemo: memo,
+      memo,
+      origSubs: subs.map((s) => ({ text: s.text, done: s.done })),
+      origSubText: new Map(subs.map((s) => [s.id, s.text])), // 줄 id → 열 때 글자(고친 줄·새 줄만 글자 수를 검사)
+      subs,
+      conflict: null,
+    };
   }
 
   /** [✏ 변경]/[✏ 닫기]: 행 아래 편집 패널을 열고 닫는다(다른 그룹에 그려진 같은 항목에서 누르면 패널을 그쪽으로 옮김). */
@@ -3242,25 +3835,20 @@ function boot() {
     if (d && editAt.get(n) === groupKey) {
       if (S.busy.has(issueKey(n))) return;
       S.edits.delete(n);
-      render();
+      render({ now: true });
       return;
     }
     if (d) {
       d.group = groupKey;
-      render();
+      render({ now: true });
       focusEditPanel(n, groupKey);
       return;
     }
     if (!requireApi()) return;
     const issue = S.issues.get(n);
     if (!issue) return;
-    const due = parseBody(issue.body).due;
-    const p = priorityOf(issue);
-    // pCount: 열 때의 p 라벨 수. 1개가 아니면(GitHub에서 2개를 붙였거나 하나도 없음) 저장할 때 고른 우선순위를 그대로 보내
-    // updateTaskMeta 가 p 라벨을 하나로 정리하게 한다(같은 값을 골라도).
-    const pCount = labelNames(issue).filter((x) => PRIORITY_KEYS.includes(x)).length;
-    S.edits.set(n, { group: groupKey, origPriority: p, origDue: due, pCount, priority: p, due: due || '', noDue: !due, lastDue: '' });
-    render();
+    S.edits.set(n, editStateFrom(issue, groupKey));
+    render({ now: true });
     focusEditPanel(n, groupKey);
   }
 
@@ -3269,17 +3857,26 @@ function boot() {
     if (S.busy.has(issueKey(n))) return;
     const g = editAt.get(n) || (S.edits.get(n) && S.edits.get(n).group) || null;
     S.edits.delete(n);
-    render();
+    render({ now: true });
     focusEditButton(n, g);
   }
+
+  const critKey = (s) => {
+    const t = oneLine(s);
+    return t === CRITERIA_UNSET ? '' : t;
+  };
+  /** 편집기 줄 → 저장될 모양(앞뒤 공백 정리, 빈 줄 버림) — 바뀌었는지 비교용 */
+  const cleanEditSubs = (list) => list.map((s) => ({ text: oneLine(s.text), done: Boolean(s.done) })).filter((s) => s.text);
 
   /**
    * [저장]: 패널을 연 뒤 바꾼 값만 보낸다(손대지 않은 칸은 그대로 — 다른 곳의 변경을 덮지 않게).
    * 단 열 때 p 라벨이 1개가 아니었으면 우선순위는 늘 보낸다(라벨 정리 — updateTaskMeta 의 'p 라벨 2개 이상·없음' 규칙).
    * 바꾼 게 없으면 요청 없이 '바뀐 내용이 없습니다'. 성공하면 패널을 닫고 응답 이슈로 그 행을 즉시 옮긴다
    * (목록 다시 받기 없음, upsert → 60초 캐시 동안 로컬 상태 우선). 포커스는 옮겨 간 행의 [✏ 변경].
+   * 6차: 완료 기준·메모·하위 작업도 같은 PATCH 한 번. 패널을 열 때 읽은 값(d.base)으로 충돌을 확인하고,
+   * 충돌(409 kind 'conflict')이면 패널·입력값을 그대로 두고 [내 내용으로 저장](force)·[최신 내용 불러오기]를 보여 준다.
    */
-  async function onEditSave(n) {
+  async function onEditSave(n, { force = false } = {}) {
     if (!requireApi()) return;
     const d = S.edits.get(n);
     if (!d || S.busy.has(issueKey(n))) return;
@@ -3288,6 +3885,11 @@ function boot() {
       const t = byId(`edit-${what}-${groupNow}-${n}`);
       if (t && !t.disabled) t.focus({ preventScroll: true });
     };
+    // 글자 칸에서 Enter 로 저장: 포커스를 [저장]으로 옮긴다(저장 중 표시가 '입력 중 다시 그리기 미룸'에 걸리지 않게).
+    if (editingIssue() === n) {
+      const sb = byId(`btn-esave-${groupNow}-${n}`);
+      if (sb && !sb.disabled) sb.focus({ preventScroll: true });
+    }
     if (!d.noDue && !d.due) {
       showMessage({ tone: 'warn', lines: [[issueLink(n), ` ${META_TEXT.needDate}`]] });
       focusField('due');
@@ -3303,16 +3905,49 @@ function boot() {
     const change = {};
     if (d.priority !== d.origPriority || d.pCount !== 1) change.priority = d.priority;
     if (want !== d.origDue) change.due = want;
+    if (critKey(d.criteria) !== critKey(d.origCriteria)) change.criteria = oneLine(d.criteria);
+    if (oneLine(d.memo) !== oneLine(d.origMemo)) change.memo = oneLine(d.memo);
+    if (!sameSubtasks(cleanEditSubs(d.subs), cleanEditSubs(d.origSubs))) change.subtasks = d.subs.map((s) => ({ text: s.text, done: Boolean(s.done) }));
     if (!Object.keys(change).length) {
       showMessage({ tone: 'info', lines: [[issueLink(n), ` ${META_TEXT.noChange}`]] });
       return;
     }
+    // 글자 수: 이번에 바꾼 칸만 검사한다(입력 칸 maxlength 가 보통 막지만, GitHub 에서 길게 적어 둔 값을 고쳤는데 아직 긴 경우).
+    // 손대지 않은 칸은 보내지 않으므로 GitHub 에서 길게 적어 둔 값이 있어도 우선순위·마감 등 다른 칸은 저장된다.
+    if ('criteria' in change && detailInputLength(d.criteria) > BODY_FIELD_MAX_CHARS) {
+      showMessage({ tone: 'warn', lines: [[issueLink(n), ` ${META_TEXT.criteriaTooLong}`]] });
+      focusField('crit');
+      return;
+    }
+    if ('memo' in change && detailInputLength(d.memo) > BODY_FIELD_MAX_CHARS) {
+      showMessage({ tone: 'warn', lines: [[issueLink(n), ` ${META_TEXT.memoTooLong}`]] });
+      focusField('memo');
+      return;
+    }
+    // 하위 작업은 새로 넣거나 글자를 고친 줄만(열 때 그대로인 긴 줄은 그대로 저장 — updateTaskMeta 가 본문에 있던 줄로 본다)
+    const touched = (s) => !d.origSubText.has(s.id) || oneLine(d.origSubText.get(s.id)) !== oneLine(s.text);
+    const longAt = 'subtasks' in change ? d.subs.findIndex((s) => touched(s) && detailInputLength(s.text) > SUBTASK_MAX_CHARS) : -1;
+    if (longAt >= 0) {
+      showMessage({ tone: 'warn', lines: [[issueLink(n), ` ${subtaskTooLongText(longAt + 1)}`]] });
+      focusEditTarget(n, 'edit-subtext', d.subs[longAt].id);
+      return;
+    }
     let target = null;
+    let conflicted = false;
     await runIssueAction(n, async () => {
       let res;
       try {
-        res = await updateTaskMeta(S.api, S.issues.get(n) || { number: n }, change, { labelCache: S.labelCache });
+        res = await updateTaskMeta(S.api, S.issues.get(n) || { number: n }, change, { labelCache: S.labelCache, base: d.base, force });
       } catch (e) {
+        // 세부 내용 충돌(409 kind 'conflict'): 패널·입력값은 그대로, 행은 GitHub 의 최신 내용으로. 사용자가 고른다.
+        if (e instanceof ApiError && e.kind === 'conflict') {
+          if (e.issue && Number.isInteger(e.issue.number)) upsert(e.issue);
+          const cur = S.edits.get(n);
+          if (cur) cur.conflict = { fields: Array.isArray(e.conflicts) ? e.conflicts : [] };
+          conflicted = true;
+          showMessage({ tone: 'warn', lines: [[issueLink(n), ` ${conflictText(e.conflicts)}`], META_TEXT.conflictChoose] });
+          return;
+        }
         // 이미 완료(409)·할 일이 아님(400): 서버의 최신 이슈로 목록을 정리하고 패널을 닫는다.
         if (e instanceof ApiError && (e.status === 409 || e.status === 400) && e.issue && Number.isInteger(e.issue.number)) {
           upsert(e.issue);
@@ -3346,11 +3981,105 @@ function boot() {
         lines: [[issueLink(n), ` ${metaChangeText(cur, res.changed, today)}`], ...metaChangeNotes(cur, res.changed, today)],
       });
     });
-    if (target && !S.edits.has(n)) focusEditButton(n, target, true);
+    if (conflicted && S.edits.has(n)) {
+      // 고를 버튼으로 포커스(사용자가 그사이 다른 곳으로 옮겼으면 그대로)
+      const a = document.activeElement;
+      const own = a && a.closest && a.closest('form.edit-panel');
+      if (focusFree() || (own && own.dataset.editFor === String(n))) focusEditTarget(n, 'btn-eforce');
+      return;
+    }
+    if (target && !S.edits.has(n) && focusFree()) focusEditButton(n, target, true);
+  }
+
+  /** [최신 내용 불러오기]: 내 입력을 버리고 GitHub 의 최신 이슈(새로 GET)로 패널을 다시 채운다(패널은 열린 채). */
+  async function onEditReload(n) {
+    if (!requireApi()) return;
+    const d0 = S.edits.get(n);
+    if (!d0 || S.busy.has(issueKey(n))) return;
+    const fields = d0.conflict ? d0.conflict.fields : [];
+    let reloaded = false;
+    await runIssueAction(n, async () => {
+      const latest = await S.api.getIssue(n);
+      if (!latest || typeof latest !== 'object') throw new ApiError(MSG.badResponse, 0);
+      upsert(latest);
+      if (latest.state === 'closed' || !isTask(latest)) {
+        S.edits.delete(n);
+        if (latest.state === 'closed') stopReplyWatch(n);
+        showMessage({
+          tone: 'error',
+          lines: [[issueLink(n), ` ${latest.state === 'closed' ? MSG.metaClosed : MSG.metaNotTask}`], META_TEXT.listUpdated],
+          actions: [{ label: '목록 새로고침', run: () => loadAll() }],
+          focus: true,
+        });
+        return;
+      }
+      const cur = S.edits.get(n) || d0;
+      S.edits.set(n, editStateFrom(latest, cur.group));
+      reloaded = true;
+      showMessage({ tone: 'info', lines: [[issueLink(n), ` ${META_TEXT.reloaded}`]] });
+    });
+    if (!reloaded || !S.edits.has(n) || !focusFree()) return;
+    // 다른 곳에서 바뀌었던 칸으로 포커스(하위 작업이면 첫 줄, 없으면 [+ 하위 작업 추가])
+    const d = S.edits.get(n);
+    const k = fields[0];
+    const ok =
+      k === 'criteria'
+        ? focusEditTarget(n, 'edit-crit')
+        : k === 'memo'
+          ? focusEditTarget(n, 'edit-memo')
+          : k === 'subtasks'
+            ? (d.subs.length && focusEditTarget(n, 'edit-subtext', d.subs[0].id)) || focusEditTarget(n, 'btn-subadd')
+            : false;
+    if (!ok) focusEditPanel(n, editAt.get(n));
+  }
+
+  /**
+   * [+ 하위 작업 추가]·Enter: afterId 줄 바로 아래(없으면 맨 끝)에 빈 줄을 넣고 그 칸으로 포커스.
+   * 50줄이면 넣지 않는다(안내는 패널에 — 추가 버튼은 꺼져 있으므로 Enter 로 온 경우 메시지 영역에도 짧게 알린다, 포커스는 그대로).
+   */
+  function onSubAdd(n, afterId) {
+    const d = S.edits.get(n);
+    if (d && !S.busy.has(issueKey(n)) && d.subs.length >= SUBTASK_LIMIT) {
+      showMessage({ tone: 'info', lines: [[issueLink(n), ` ${META_TEXT.subtaskLimit}`]] });
+      return;
+    }
+    if (!d || S.busy.has(issueKey(n)) || d.subs.length >= SUBTASK_LIMIT) return;
+    const row = { id: ++subSeq, text: '', done: false };
+    const i = afterId == null ? -1 : d.subs.findIndex((s) => s.id === afterId);
+    d.subs.splice(i < 0 ? d.subs.length : i + 1, 0, row);
+    render({ now: true });
+    focusEditTarget(n, 'edit-subtext', row.id);
+  }
+
+  /** ▲/▼: 그 줄을 한 칸 옮기고 같은 줄의 같은 버튼에 포커스(끝에 닿아 그 버튼이 꺼지면 반대쪽 버튼). */
+  function onSubMove(n, id, delta) {
+    const d = S.edits.get(n);
+    if (!d || S.busy.has(issueKey(n))) return;
+    const i = d.subs.findIndex((s) => s.id === id);
+    const j = i + delta;
+    if (i < 0 || j < 0 || j >= d.subs.length) return;
+    [d.subs[i], d.subs[j]] = [d.subs[j], d.subs[i]];
+    render({ now: true });
+    const same = delta < 0 ? 'btn-subup' : 'btn-subdown';
+    const other = delta < 0 ? 'btn-subdown' : 'btn-subup';
+    if (!focusEditTarget(n, same, id)) focusEditTarget(n, other, id);
+  }
+
+  /** [삭제]: 그 줄을 지우고 다음 줄(없으면 앞 줄) 글자 칸으로, 다 지웠으면 [+ 하위 작업 추가] 로 포커스. */
+  function onSubDelete(n, id) {
+    const d = S.edits.get(n);
+    if (!d || S.busy.has(issueKey(n))) return;
+    const i = d.subs.findIndex((s) => s.id === id);
+    if (i < 0) return;
+    d.subs.splice(i, 1);
+    render({ now: true });
+    const next = d.subs[i] || d.subs[i - 1];
+    if (!(next && focusEditTarget(n, 'edit-subtext', next.id))) focusEditTarget(n, 'btn-subadd');
   }
 
   function onSubtaskToggle(n, item, checked) {
-    if (!requireApi()) {
+    if (!requireApi() || S.edits.has(n)) {
+      // 토큰 없음·편집 패널이 열림(그 패널에서 바꾼다): 체크 표시를 원래대로 되돌린다
       render();
       return;
     }
@@ -3414,6 +4143,11 @@ function boot() {
   /** [본문에 반영]: 패널·알림 공용. 답글의 하위 작업을 최신 본문에 추가하고 stuck 을 뗀다. 화면은 반환값으로 즉시 갱신. */
   async function onApplyReply(n) {
     if (!requireApi()) return;
+    if (S.edits.has(n)) {
+      // 같은 항목의 [✏ 변경] 패널이 열려 있으면 반영하지 않는다(버튼도 꺼져 있다 — 패널의 하위 작업과 서로 덮어쓰지 않게)
+      showMessage({ tone: 'info', lines: [[issueLink(n), ` ${META_TEXT.editingApply}`]] });
+      return;
+    }
     const entry = S.replies.get(n);
     const reply = entry && entry.reply;
     const items = reply && reply.state !== 'working' ? parseReplyChecklist(reply.body) : [];
@@ -3527,8 +4261,8 @@ function boot() {
     const tick = async () => {
       w.timer = null;
       if (!alive()) return;
-      // 날짜 칸에 입력 중이면 확인을 미룬다(세지 않음): 그 칸을 벗어나면 곧 확인하고 알린다
-      if (editingDueField()) {
+      // 편집 패널 칸(날짜·글자)에 입력 중이면 확인을 미룬다(세지 않음): 그 칸을 벗어나면 곧 확인하고 알린다
+      if (editingField()) {
         w.timer = setTimeout(tick, EDIT_DEFER_MS);
         return;
       }
@@ -3538,8 +4272,8 @@ function boot() {
       try {
         const comments = await w.api.listComments(n);
         if (!alive()) return;
-        if (editingDueField()) {
-          // 응답을 기다리는 사이 날짜 칸에 들어갔으면 이번 결과는 버리고 다시 미룬다(다시 그리기 없음)
+        if (editingField()) {
+          // 응답을 기다리는 사이 편집 패널 칸에 들어갔으면 이번 결과는 버리고 다시 미룬다(다시 그리기 없음)
           w.checks -= 1;
           w.timer = setTimeout(tick, EDIT_DEFER_MS);
           return;
@@ -3549,7 +4283,7 @@ function boot() {
         reply = findClaudeReply(comments, { since: w.since });
       } catch (e) {
         if (!alive()) return;
-        if (editingDueField()) {
+        if (editingField()) {
           w.checks -= 1;
           w.timer = setTimeout(tick, EDIT_DEFER_MS);
           return;
@@ -3793,8 +4527,8 @@ function boot() {
     testConnectionUI();
   });
   const checkDayChange = () => {
-    // 날짜 칸에 입력 중이면 다음 확인(1분 뒤·화면 복귀)으로 미룬다(EDIT_DEFER_MS 설명 참고)
-    if (todayKST() !== S.today && !editingDueField()) render();
+    // 편집 패널 칸(날짜·글자)에 입력 중이면 다음 확인(1분 뒤·화면 복귀)으로 미룬다(EDIT_DEFER_MS 설명 참고)
+    if (todayKST() !== S.today && !editingField()) render();
   };
   setInterval(checkDayChange, 60000);
   document.addEventListener('visibilitychange', () => {

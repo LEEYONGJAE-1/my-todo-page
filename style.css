@@ -785,6 +785,28 @@ tr.is-busy {
   font-weight: 700;
 }
 
+/* 행 제목 아래 '완료 기준: …'·'메모: …' (다음: 줄과 같은 작은 글씨). 길면 한 줄 말줄임 — 하위 작업을 펼치면(is-full) 전체.
+   contain: inline-size — 긴 값이 표의 '할 일' 칸 폭을 넓히지 않게(칸 폭 안에서 말줄임) */
+.detail-line {
+  margin-top: 4px;
+  font-size: 0.9rem;
+  color: var(--muted);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  contain: inline-size;
+}
+
+.detail-line.is-full {
+  white-space: normal;
+  overflow: visible;
+  contain: none;
+}
+
+.detail-key {
+  font-weight: 700;
+}
+
 .due-over {
   color: var(--red);
   font-weight: 700;
@@ -931,6 +953,22 @@ tr.is-busy {
 .sub-list label.is-done span {
   text-decoration: line-through;
   color: var(--muted);
+}
+
+/* [✏ 변경] 패널이 열린 동안: 펼친 하위 작업 체크는 잠금(글자 대비는 그대로, 커서만) + 안내 */
+.sub-list label.is-locked {
+  cursor: not-allowed;
+}
+
+.sub-list label.is-locked:hover {
+  background: transparent;
+}
+
+.sub-lock {
+  margin: 2px 0 0;
+  padding: 0 4px;
+  color: var(--muted);
+  font-size: 0.85rem;
 }
 
 /* 🆘 Claude 답변 패널 (답글은 신뢰할 수 없는 텍스트 — 화면은 textContent 로만 그린다) */
@@ -1253,6 +1291,144 @@ input[type="date"]:disabled {
   gap: 8px;
 }
 
+/* 6차: 완료 기준·메모(한 줄 입력), 하위 작업 편집기, 충돌 안내 */
+.edit-field {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  min-width: 0;
+}
+
+.edit-field-label {
+  font-weight: 700;
+  color: var(--text);
+}
+
+.edit-panel input[type="text"] {
+  min-height: var(--tap);
+  min-width: 0;
+}
+
+.edit-panel input[type="text"]:disabled {
+  opacity: 0.6;
+  cursor: not-allowed;
+}
+
+.edit-note {
+  color: var(--muted);
+  font-size: 0.85rem;
+}
+
+.edit-marker {
+  align-self: flex-start;
+  max-width: 100%;
+  padding: 2px 8px;
+  color: var(--text);
+  background: var(--surface);
+  border: 1px dashed var(--border);
+  border-radius: 6px;
+  font-size: 0.85rem;
+  font-variant-numeric: tabular-nums;
+}
+
+.sub-edit-list {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
+.sub-edit-row {
+  display: grid;
+  grid-template-columns: auto minmax(0, 1fr) auto;
+  align-items: center;
+  gap: 6px;
+}
+
+.sub-edit-check {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: var(--tap);
+  height: var(--tap);
+  border-radius: 8px;
+  cursor: pointer;
+}
+
+.sub-edit-check:hover {
+  background: var(--surface);
+}
+
+.sub-edit-check input {
+  flex: none;
+  width: 20px;
+  height: 20px;
+  margin: 0;
+  accent-color: var(--accent);
+}
+
+.sub-edit-check:has(input:disabled) {
+  cursor: not-allowed;
+}
+
+.sub-edit-row.is-done .sub-edit-text {
+  text-decoration: line-through;
+  color: var(--muted);
+}
+
+.sub-edit-btns {
+  display: flex;
+  gap: 4px;
+}
+
+.sub-edit-btn {
+  min-width: var(--tap);
+  padding: 0 10px;
+}
+
+button.sub-edit-del {
+  color: var(--danger);
+}
+
+.sub-edit-foot {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  margin-top: 6px;
+}
+
+.sub-edit-empty {
+  padding: 2px 0;
+}
+
+.edit-subs .edit-note {
+  margin-top: 4px;
+}
+
+.edit-conflict {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  padding: 8px 10px;
+  background: var(--surface);
+  border: 1px solid var(--warn);
+  border-left-width: 4px;
+  border-radius: 8px;
+}
+
+.edit-conflict-text {
+  color: var(--text);
+  font-weight: 700;
+}
+
+.edit-conflict-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+}
+
 /* 이번 주 완료 / 반복 목록 */
 .plain-list {
   list-style: none;
@@ -1479,6 +1655,22 @@ button.done-hide:hover:not(:disabled) {
   }
 
   .edit-actions button {
+    flex: 1 1 auto;
+  }
+
+  /* 하위 작업 줄: [체크][글자 칸] / 아래 줄 오른쪽에 [▲][▼][삭제] (360px 에서도 글자 칸을 넓게) */
+  .sub-edit-row {
+    grid-template-columns: auto minmax(0, 1fr);
+    row-gap: 4px;
+  }
+
+  .sub-edit-btns {
+    grid-column: 2;
+    justify-content: flex-end;
+  }
+
+  .sub-edit-foot button,
+  .edit-conflict-actions button {
     flex: 1 1 auto;
   }
 }
